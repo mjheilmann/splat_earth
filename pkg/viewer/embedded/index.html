@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>3D Gaussian Splat Spheroid Terrain Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="canvas-container">
+        <canvas id="gl-canvas"></canvas>
+    </div>
+
+    <!-- HUD Overlay Top-Left -->
+    <header class="hud-panel top-left glass-card">
+        <div class="brand">
+            <div class="brand-badge">3DGS</div>
+            <div class="brand-title">
+                <h1>Spheroid Splat Terrain</h1>
+                <span class="subtitle">Geometry-less Oblate Ellipsoid GIS Spike</span>
+            </div>
+        </div>
+        <div class="metrics-grid">
+            <div class="metric">
+                <span class="label">FPS</span>
+                <span class="val" id="metric-fps">60</span>
+            </div>
+            <div class="metric">
+                <span class="label">ACTIVE SPLATS</span>
+                <span class="val" id="metric-splats">0</span>
+            </div>
+            <div class="metric">
+                <span class="label">CHUNKS VISIBLE</span>
+                <span class="val" id="metric-chunks">0 / 0</span>
+            </div>
+            <div class="metric">
+                <span class="label">AVG SPACING</span>
+                <span class="val" id="metric-spacing">--</span>
+            </div>
+            <div class="metric">
+                <span class="label">TOTAL DATA</span>
+                <span class="val" id="metric-bytes">0 MB</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- Camera Telemetry Bottom-Left -->
+    <div class="hud-panel bottom-left glass-card">
+        <div class="panel-header">
+            <span class="icon">🧭</span>
+            <span>Geodetic Telemetry</span>
+        </div>
+        <div class="telemetry-rows">
+            <div class="tele-row">
+                <span class="t-label">Latitude</span>
+                <span class="t-val" id="tele-lat">0.00°</span>
+            </div>
+            <div class="tele-row">
+                <span class="t-label">Longitude</span>
+                <span class="t-val" id="tele-lon">0.00°</span>
+            </div>
+            <div class="tele-row">
+                <span class="t-label">Altitude</span>
+                <span class="t-val" id="tele-alt">0.0 m</span>
+            </div>
+            <div class="tele-row">
+                <span class="t-label">Camera Mode</span>
+                <span class="t-val highlight" id="tele-cam-mode">FLY (6-DOF)</span>
+            </div>
+        </div>
+    </div>
+
+    <!-- Controls & Tuning Sidebar Right -->
+    <aside class="sidebar glass-card" id="sidebar">
+        <div class="sidebar-header">
+            <h2>Controls & Parameters</h2>
+            <button id="toggle-sidebar-btn" class="icon-btn" title="Toggle Sidebar">✕</button>
+        </div>
+
+        <div class="sidebar-content">
+            <!-- Camera Mode Section -->
+            <div class="control-group">
+                <label class="group-title">Camera Mode</label>
+                <div class="segmented-control">
+                    <button class="seg-btn active" id="btn-mode-fly">Fly Cam</button>
+                    <button class="seg-btn" id="btn-mode-orbit">Orbit</button>
+                </div>
+                <div class="nav-help" id="fly-help">
+                    <small><b>WASD</b>: Move | <b>Q/E</b>: Roll | <b>Space/C</b>: Up/Down | <b>Drag</b>: 6-DOF Look | <b>Scroll</b>: Speed</small>
+                </div>
+                <div class="nav-help hidden" id="orbit-help">
+                    <small><b>Left Drag</b>: Rotate | <b>Right Drag</b>: Pan | <b>Scroll</b>: Zoom</small>
+                </div>
+                <button id="btn-frame-planet" class="action-btn secondary-btn" style="margin-top: 4px;">
+                    <span>🎯 Frame Whole Planet</span>
+                </button>
+            </div>
+
+            <!-- Splat Visual Tuning -->
+            <div class="control-group">
+                <label class="group-title">Splat Rendering</label>
+                
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Planar Overlap / Scale (X,Y)</span>
+                        <span class="slider-val" id="val-scale">1.00x</span>
+                    </div>
+                    <input type="range" id="slider-scale" min="0.2" max="3.0" step="0.05" value="1.0">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Normal Thickness (Z)</span>
+                        <span class="slider-val" id="val-thickness">0.35x</span>
+                    </div>
+                    <input type="range" id="slider-thickness" min="0.02" max="2.0" step="0.02" value="0.35">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Alpha Boost</span>
+                        <span class="slider-val" id="val-alpha">1.0x</span>
+                    </div>
+                    <input type="range" id="slider-alpha" min="0.2" max="2.0" step="0.1" value="1.0">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Flight Speed</span>
+                        <span class="slider-val" id="val-speed">60 km/s</span>
+                    </div>
+                    <input type="range" id="slider-speed" min="1" max="500" step="5" value="60">
+                </div>
+
+                <div class="select-control">
+                    <label for="select-shading">Color Mode</label>
+                    <select id="select-shading">
+                        <option value="0">Biome Colors</option>
+                        <option value="1">Elevation Colormap</option>
+                        <option value="2">Surface Normals</option>
+                        <option value="3">Gaussian Footprint Debug</option>
+                    </select>
+                </div>
+
+                <div class="checkbox-control">
+                    <label>
+                        <input type="checkbox" id="check-spheroid-grid" checked>
+                        <span>Show Spheroid Equator / Grid</span>
+                    </label>
+                </div>
+                <div class="checkbox-control">
+                    <label>
+                        <input type="checkbox" id="check-depth-sort" checked>
+                        <span>Sort Splats (Back-to-Front)</span>
+                    </label>
+                </div>
+            </div>
+
+            <!-- Live Generator Stand-In Section -->
+            <div class="control-group">
+                <label class="group-title">GIS Stand-In Generator</label>
+                
+                <div class="input-row">
+                    <div class="input-col">
+                        <label>Radius (a, km)</label>
+                        <input type="number" id="gen-radius" value="100" min="1" max="100000">
+                    </div>
+                    <div class="input-col">
+                        <label>Flattening (f)</label>
+                        <input type="number" id="gen-flattening" value="0.05" step="0.005" min="0" max="0.25">
+                    </div>
+                </div>
+
+                <div class="input-row">
+                    <div class="input-col">
+                        <label>Lat Rings</label>
+                        <input type="number" id="gen-res-lat" value="150" min="20" max="200000" step="100">
+                    </div>
+                    <div class="input-col">
+                        <label>Equator Lon Base</label>
+                        <input type="number" id="gen-res-lon" value="300" min="20" max="200000" step="100">
+                    </div>
+                </div>
+
+                <div class="select-control">
+                    <label for="select-terrain-preset">Terrain Preset</label>
+                    <select id="select-terrain-preset">
+                        <option value="earth">Earth-like (Continents & Oceans)</option>
+                        <option value="highlands">Mountainous Highlands</option>
+                        <option value="archipelago">Archipelago & Islands</option>
+                        <option value="pangaea">Pangaea Supercontinent</option>
+                        <option value="smooth">Smooth Ellipsoid (Low Relief)</option>
+                    </select>
+                </div>
+
+                <div class="input-row">
+                    <div class="input-col">
+                        <label>Elev Scale (km)</label>
+                        <input type="number" id="gen-elev" value="12.0" step="0.5" min="0" max="1000">
+                    </div>
+                    <div class="input-col">
+                        <label>Elev Offset (shift)</label>
+                        <input type="number" id="gen-elev-offset" value="0.0" step="0.05" min="-0.6" max="0.6">
+                    </div>
+                </div>
+
+                <div class="input-row">
+                    <div class="input-col">
+                        <label>Noise Seed</label>
+                        <input type="number" id="gen-seed" value="42">
+                    </div>
+                    <div class="input-col">
+                        <label>Noise Frequency</label>
+                        <input type="number" id="gen-freq" value="1.5" step="0.1" min="0.2" max="10">
+                    </div>
+                </div>
+
+                <div class="input-row">
+                    <div class="input-col">
+                        <label>Chunk Grid Geometry</label>
+                        <select id="gen-chunk-grid">
+                            <option value="auto" selected>⚡ Auto-Adaptive (Density Optimized)</option>
+                            <option value="cubed-4">6 Faces x 4x4 (96 Patches) - Cubed-Sphere</option>
+                            <option value="cubed-6">6 Faces x 6x6 (216 Patches) - Cubed-Sphere</option>
+                            <option value="cubed-8">6 Faces x 8x8 (384 Patches) - Cubed-Sphere</option>
+                            <option value="cubed-2">6 Faces x 2x2 (24 Patches) - Cubed-Sphere</option>
+                            <option value="8x16">8 x 16 (128 Chunks) - Lat/Lon</option>
+                            <option value="12x24">12 x 24 (288 Chunks) - Lat/Lon</option>
+                        </select>
+                    </div>
+                </div>
+
+                <div class="checkbox-control" style="margin-top: 6px;">
+                    <label>
+                        <input type="checkbox" id="check-adaptive-density" checked>
+                        <span><b>⚡ Variable Density (Quadtree Adaptive)</b></span>
+                    </label>
+                </div>
+
+                <div class="slider-control" id="group-curv-tol">
+                    <div class="slider-header">
+                        <span>Curvature Tolerance (Δh)</span>
+                        <span class="slider-val" id="val-curv-tol">0.12 km</span>
+                    </div>
+                    <input type="range" id="slider-curv-tol" min="0.02" max="1.0" step="0.02" value="0.12">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>LOD Distance Bias</span>
+                        <span class="slider-val" id="val-lod-bias">1.0x</span>
+                    </div>
+                    <input type="range" id="slider-lod-bias" min="0.3" max="3.0" step="0.1" value="1.0">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Overlap Factor</span>
+                        <span class="slider-val" id="val-gen-overlap">1.35</span>
+                    </div>
+                    <input type="range" id="gen-overlap" min="0.8" max="2.0" step="0.05" value="1.35">
+                </div>
+
+                <button id="btn-regenerate" class="action-btn primary-btn">
+                    <span>⚡ Regenerate Splats</span>
+                </button>
+            </div>
+        </div>
+    </aside>
+
+    <!-- Floating Toggle Button when Sidebar is closed -->
+    <button id="open-sidebar-btn" class="floating-btn glass-card hidden" title="Open Settings">
+        ⚙️ Settings
+    </button>
+
+    <!-- Loading Indicator -->
+    <div id="loader" class="loader-overlay glass-card">
+        <div class="spinner"></div>
+        <div class="loader-text" id="loader-msg">Loading 3D Gaussian Splats...</div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

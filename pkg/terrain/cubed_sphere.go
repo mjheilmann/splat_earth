@@ -1,0 +1,629 @@
+package terrain
+
+import (
+	"math"
+	"runtime"
+	"sync"
+
+	"github.com/myuser/gaussian-splat-app/pkg/spheroid"
+	"github.com/myuser/gaussian-splat-app/pkg/splat"
+)
+
+// CubeFace represents one of the 6 cardinal faces of a spherified cube.
+type CubeFace int
+
+const (
+	FacePosX CubeFace = iota // +X (0° Lon Equator)
+	FacePosY                 // +Y (+90° Lon Equator)
+	FaceNegX                 // -X (180° Lon Equator)
+	FaceNegY                 // -Y (-90° Lon Equator)
+	FacePosZ                 // +Z (North Pole Face)
+	FaceNegZ                 // -Z (South Pole Face)
+)
+
+// FaceBasis returns the origin and tangent axes for a cube face in [-1, 1]^3 space.
+func (f CubeFace) FaceBasis() (center, uAxis, vAxis spheroid.Vec3) {
+	switch f {
+	case FacePosX:
+		return spheroid.Vec3{X: 1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: 1, Z: 0}, spheroid.Vec3{X: 0, Y: 0, Z: 1}
+	case FacePosY:
+		return spheroid.Vec3{X: 0, Y: 1, Z: 0}, spheroid.Vec3{X: -1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: 0, Z: 1}
+	case FaceNegX:
+		return spheroid.Vec3{X: -1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: -1, Z: 0}, spheroid.Vec3{X: 0, Y: 0, Z: 1}
+	case FaceNegY:
+		return spheroid.Vec3{X: 0, Y: -1, Z: 0}, spheroid.Vec3{X: 1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: 0, Z: 1}
+	case FacePosZ:
+		return spheroid.Vec3{X: 0, Y: 0, Z: 1}, spheroid.Vec3{X: 1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: 1, Z: 0}
+	case FaceNegZ:
+		return spheroid.Vec3{X: 0, Y: 0, Z: -1}, spheroid.Vec3{X: 1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: -1, Z: 0}
+	}
+	return spheroid.Vec3{X: 1, Y: 0, Z: 0}, spheroid.Vec3{X: 0, Y: 1, Z: 0}, spheroid.Vec3{X: 0, Y: 0, Z: 1}
+}
+
+// DensityMetrics contains spatial density and chunk recommendations.
+type DensityMetrics struct {
+	TotalPoints               int     `json:"totalPoints"`
+	SurfaceAreaKm2            float64 `json:"surfaceAreaKm2"`
+	SplatsPerKm2              float64 `json:"splatsPerKm2"`
+	MeanSpacingMeters         float64 `json:"meanSpacingMeters"`
+	RecommendedPatchesPerFace int     `json:"recommendedPatchesPerFace"`
+	TotalChunks               int     `json:"totalChunks"`
+	SplatsPerChunkLOD0        int     `json:"splatsPerChunkLOD0"`
+}
+
+// EstimatePointDensity calculates the spatial density and recommends optimal chunk partitioning.
+func (tg *TerrainGenerator) EstimatePointDensity(totalPoints int) DensityMetrics {
+	if totalPoints <= 0 {
+		totalPoints = tg.config.StepsLat * tg.config.StepsLon
+	}
+	a := tg.config.Spheroid.SemiMajorAxis
+	b := tg.config.Spheroid.SemiMinorAxis
+
+	e := math.Sqrt(math.Max(0.0, 1.0-(b*b)/(a*a)))
+	var surfaceArea float64
+	if e < 1e-4 {
+		surfaceArea = 4.0 * math.Pi * a * a
+	} else {
+		surfaceArea = 2.0*math.Pi*a*a + math.Pi*(b*b/e)*math.Log((1.0+e)/(1.0-e))
+	}
+
+	splatsPerKm2 := float64(totalPoints) / surfaceArea
+	meanSpacingKm := math.Sqrt(surfaceArea / float64(totalPoints))
+	meanSpacingMeters := meanSpacingKm * 1000.0
+
+	// Target ~4,000 to ~12,000 splats per chunk at LOD 0 for optimal GPU streaming & culling
+	targetChunks := float64(totalPoints) / 8192.0
+	patchesPerFace := int(math.Round(math.Sqrt(targetChunks / 6.0)))
+	if patchesPerFace < 2 {
+		patchesPerFace = 2 // Minimum 6 x 4 = 24 chunks
+	} else if patchesPerFace > 32 {
+		patchesPerFace = 32 // Maximum 6 x 1024 = 6144 chunks
+	}
+
+	totalChunksCount := 6 * patchesPerFace * patchesPerFace
+	splatsPerChunk := totalPoints / totalChunksCount
+
+	return DensityMetrics{
+		TotalPoints:               totalPoints,
+		SurfaceAreaKm2:            surfaceArea,
+		SplatsPerKm2:              splatsPerKm2,
+		MeanSpacingMeters:         meanSpacingMeters,
+		RecommendedPatchesPerFace: patchesPerFace,
+		TotalChunks:               totalChunksCount,
+		SplatsPerChunkLOD0:        splatsPerChunk,
+	}
+}
+
+// lodTargetResolutions defines the target point count per patch axis for each LOD level.
+// LOD 0 targets native full resolution.
+// LOD 1-4 target fixed resolutions (doubled target budgets) so high-altitude and orbit budgets remain constant and crisp regardless of global density.
+var lodTargetResolutions = [5]int{0, 96, 48, 24, 12}
+
+func computeLODStride(nativeRes int, lod int) int {
+	if lod <= 0 {
+		return 1
+	}
+	if lod > 4 {
+		lod = 4
+	}
+	targetRes := lodTargetResolutions[lod]
+	if targetRes <= 0 || nativeRes <= targetRes {
+		stride := 1 << lod
+		if stride > nativeRes && nativeRes > 0 {
+			stride = nativeRes
+		}
+		if stride < 1 {
+			stride = 1
+		}
+		return stride
+	}
+	stride := int(math.Max(1, math.Round(float64(nativeRes)/float64(targetRes))))
+	return stride
+}
+
+// GenerateCubedSphereTerrain partitions the oblate spheroid into 6 cube faces,
+// each split into patchesPerFaceAxis x patchesPerFaceAxis spatial chunks with multi-LOD splats.
+// If patchesPerFaceAxis <= 0, it automatically estimates point density and selects the optimal chunk grid.
+// Chunk generation is fully parallelized across all available CPU cores.
+func (tg *TerrainGenerator) GenerateCubedSphereTerrain(patchesPerFaceAxis int) *ChunkedTerrain {
+	if patchesPerFaceAxis <= 0 {
+		metrics := tg.EstimatePointDensity(0)
+		patchesPerFaceAxis = metrics.RecommendedPatchesPerFace
+	}
+
+	cfg := tg.config
+	totalChunks := 6 * patchesPerFaceAxis * patchesPerFaceAxis
+	chunks := make([]Chunk, totalChunks)
+	manifests := make([]ChunkManifest, totalChunks)
+
+	// Total points target divided evenly across all 6 faces and patches
+	totalPointsTarget := cfg.StepsLat * cfg.StepsLon
+	pointsPerPatchSide := int(math.Max(4, math.Round(math.Sqrt(float64(totalPointsTarget)/float64(totalChunks)))))
+
+	type patchTask struct {
+		chunkID int
+		face    int
+		pu      int
+		pv      int
+		uMin    float64
+		uMax    float64
+		vMin    float64
+		vMax    float64
+	}
+
+	tasks := make(chan patchTask, totalChunks)
+	patchSize := 2.0 / float64(patchesPerFaceAxis)
+	id := 0
+
+	for face := 0; face < 6; face++ {
+		for pu := 0; pu < patchesPerFaceAxis; pu++ {
+			uMin := -1.0 + float64(pu)*patchSize
+			uMax := uMin + patchSize
+
+			for pv := 0; pv < patchesPerFaceAxis; pv++ {
+				vMin := -1.0 + float64(pv)*patchSize
+				vMax := vMin + patchSize
+
+				tasks <- patchTask{
+					chunkID: id,
+					face:    face,
+					pu:      pu,
+					pv:      pv,
+					uMin:    uMin,
+					uMax:    uMax,
+					vMin:    vMin,
+					vMax:    vMax,
+				}
+				id++
+			}
+		}
+	}
+	close(tasks)
+
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for task := range tasks {
+				cubeFace := CubeFace(task.face)
+				fCenter, fUAxis, fVAxis := cubeFace.FaceBasis()
+
+				s0 := computeLODStride(pointsPerPatchSide, 0)
+				s1 := computeLODStride(pointsPerPatchSide, 1)
+				s2 := computeLODStride(pointsPerPatchSide, 2)
+				s3 := computeLODStride(pointsPerPatchSide, 3)
+				s4 := computeLODStride(pointsPerPatchSide, 4)
+
+				lod0 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s0)
+				lod1 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s1)
+				lod2 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s2)
+				lod3 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s3)
+				lod4 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s4)
+
+				center, radius, normal := computePatchBounds(lod0, cfg.Spheroid, fCenter, fUAxis, fVAxis, (task.uMin+task.uMax)*0.5, (task.vMin+task.vMax)*0.5)
+
+				chunk := Chunk{
+					ID:     task.chunkID,
+					Row:    task.face*patchesPerFaceAxis + task.pu,
+					Col:    task.pv,
+					Center: center,
+					Radius: radius,
+					Normal: normal,
+					LODs:   [5][]splat.Splat{lod0, lod1, lod2, lod3, lod4},
+				}
+
+				chunks[task.chunkID] = chunk
+				manifests[task.chunkID] = ChunkManifest{
+					ID:        task.chunkID,
+					Center:    center,
+					Radius:    radius,
+					Normal:    normal,
+					CountsLOD: [5]int{len(lod0), len(lod1), len(lod2), len(lod3), len(lod4)},
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	return &ChunkedTerrain{
+		Chunks:    chunks,
+		Manifests: manifests,
+		Spheroid:  cfg.Spheroid,
+	}
+}
+
+// ProceduralCubedSphere provides O(1) instant chunk manifest generation and on-demand streaming for billions of splats with zero memory paging.
+type ProceduralCubedSphere struct {
+	Config             GeneratorConfig
+	PatchesPerFaceAxis int
+	TotalChunks        int
+	PointsPerPatchSide int
+	Manifests          []ChunkManifest
+}
+
+// NewProceduralCubedSphere computes spatial chunk bounds in O(1) without allocating splat slices in RAM.
+func (tg *TerrainGenerator) NewProceduralCubedSphere(patchesPerFaceAxis int) *ProceduralCubedSphere {
+	if patchesPerFaceAxis <= 0 {
+		metrics := tg.EstimatePointDensity(0)
+		patchesPerFaceAxis = metrics.RecommendedPatchesPerFace
+	}
+
+	cfg := tg.config
+	totalChunks := 6 * patchesPerFaceAxis * patchesPerFaceAxis
+	manifests := make([]ChunkManifest, totalChunks)
+
+	totalPointsTarget := cfg.StepsLat * cfg.StepsLon
+	pointsPerPatchSide := int(math.Max(4, math.Round(math.Sqrt(float64(totalPointsTarget)/float64(totalChunks)))))
+	patchSize := 2.0 / float64(patchesPerFaceAxis)
+
+	id := 0
+	for face := 0; face < 6; face++ {
+		cubeFace := CubeFace(face)
+		fCenter, fUAxis, fVAxis := cubeFace.FaceBasis()
+
+		for pu := 0; pu < patchesPerFaceAxis; pu++ {
+			uMin := -1.0 + float64(pu)*patchSize
+			uMax := uMin + patchSize
+			midU := (uMin + uMax) * 0.5
+
+			for pv := 0; pv < patchesPerFaceAxis; pv++ {
+				vMin := -1.0 + float64(pv)*patchSize
+				vMax := vMin + patchSize
+				midV := (vMin + vMax) * 0.5
+
+				// Analytical chunk center and normal
+				cX := fCenter.X + midU*fUAxis.X + midV*fVAxis.X
+				cY := fCenter.Y + midU*fUAxis.Y + midV*fVAxis.Y
+				cZ := fCenter.Z + midU*fUAxis.Z + midV*fVAxis.Z
+				lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+				if lenC < 1e-6 {
+					lenC = 1.0
+				}
+				norm := [3]float32{float32(cX / lenC), float32(cY / lenC), float32(cZ / lenC)}
+
+				latRad := math.Asin(math.Max(-1.0, math.Min(1.0, cZ/lenC)))
+				lonRad := math.Atan2(cY, cX)
+				centerPos := cfg.Spheroid.GeodeticToECEF(latRad*180/math.Pi, lonRad*180/math.Pi, cfg.ElevationScale*0.5)
+				center := [3]float32{float32(centerPos.X), float32(centerPos.Y), float32(centerPos.Z)}
+
+				// Analytical bounding radius
+				cornerX := fCenter.X + uMax*fUAxis.X + vMax*fVAxis.X
+				cornerY := fCenter.Y + uMax*fUAxis.Y + vMax*fVAxis.Y
+				cornerZ := fCenter.Z + uMax*fUAxis.Z + vMax*fVAxis.Z
+				lenCorner := math.Sqrt(cornerX*cornerX + cornerY*cornerY + cornerZ*cornerZ)
+				cornerLat := math.Asin(math.Max(-1.0, math.Min(1.0, cornerZ/lenCorner))) * 180 / math.Pi
+				cornerLon := math.Atan2(cornerY, cornerX) * 180 / math.Pi
+				cornerPos := cfg.Spheroid.GeodeticToECEF(cornerLat, cornerLon, cfg.ElevationScale)
+				dx := float64(center[0]) - cornerPos.X
+				dy := float64(center[1]) - cornerPos.Y
+				dz := float64(center[2]) - cornerPos.Z
+				radius := float32(math.Sqrt(dx*dx+dy*dy+dz*dz)*1.25 + 2.0)
+
+				s0 := computeLODStride(pointsPerPatchSide, 0)
+				s1 := computeLODStride(pointsPerPatchSide, 1)
+				s2 := computeLODStride(pointsPerPatchSide, 2)
+				s3 := computeLODStride(pointsPerPatchSide, 3)
+				s4 := computeLODStride(pointsPerPatchSide, 4)
+
+				n0 := (pointsPerPatchSide + s0 - 1) / s0
+				n1 := (pointsPerPatchSide + s1 - 1) / s1
+				n2 := (pointsPerPatchSide + s2 - 1) / s2
+				n3 := (pointsPerPatchSide + s3 - 1) / s3
+				n4 := (pointsPerPatchSide + s4 - 1) / s4
+
+				c0 := n0 * n0
+				c1 := n1 * n1
+				c2 := n2 * n2
+				c3 := n3 * n3
+				c4 := n4 * n4
+				if c0 < 1 { c0 = 1 }
+				if c1 < 1 { c1 = 1 }
+				if c2 < 1 { c2 = 1 }
+				if c3 < 1 { c3 = 1 }
+				if c4 < 1 { c4 = 1 }
+
+				manifests[id] = ChunkManifest{
+					ID:        id,
+					Center:    center,
+					Radius:    radius,
+					Normal:    norm,
+					CountsLOD: [5]int{c0, c1, c2, c3, c4},
+				}
+				id++
+			}
+		}
+	}
+
+	return &ProceduralCubedSphere{
+		Config:             cfg,
+		PatchesPerFaceAxis: patchesPerFaceAxis,
+		TotalChunks:        totalChunks,
+		PointsPerPatchSide: pointsPerPatchSide,
+		Manifests:          manifests,
+	}
+}
+
+// SampleChunkLOD generates splats on demand for a single requested chunk and LOD.
+func (p *ProceduralCubedSphere) SampleChunkLOD(chunkID int, lod int) []splat.Splat {
+	if chunkID < 0 || chunkID >= p.TotalChunks {
+		return nil
+	}
+
+	patchesPerFace := p.PatchesPerFaceAxis
+	face := chunkID / (patchesPerFace * patchesPerFace)
+	rem := chunkID % (patchesPerFace * patchesPerFace)
+	pu := rem / patchesPerFace
+	pv := rem % patchesPerFace
+
+	patchSize := 2.0 / float64(patchesPerFace)
+	uMin := -1.0 + float64(pu)*patchSize
+	uMax := uMin + patchSize
+	vMin := -1.0 + float64(pv)*patchSize
+	vMax := vMin + patchSize
+
+	cubeFace := CubeFace(face)
+	fCenter, fUAxis, fVAxis := cubeFace.FaceBasis()
+
+	stride := computeLODStride(p.PointsPerPatchSide, lod)
+
+	tg := NewTerrainGenerator(p.Config)
+	return tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, uMin, uMax, vMin, vMax, p.PointsPerPatchSide, patchesPerFace, stride)
+}
+
+// GenerateCubedSphereSplats generates a single combined slice of LOD 0 splats across all 6 faces of the cubed spheroid.
+func (tg *TerrainGenerator) GenerateCubedSphereSplats(patchesPerFaceAxis int) []splat.Splat {
+	chunked := tg.GenerateCubedSphereTerrain(patchesPerFaceAxis)
+	total := 0
+	for _, ch := range chunked.Chunks {
+		total += len(ch.LODs[0])
+	}
+	all := make([]splat.Splat, 0, total)
+	for _, ch := range chunked.Chunks {
+		all = append(all, ch.LODs[0]...)
+	}
+	return all
+}
+
+// sampleCubedSpherePatch samples Gaussian splats over a spherified cube face patch.
+// When cfg.AdaptiveDensity is true, it uses quadtree curvature-adaptive sampling to collapse flat plains/oceans into larger splats.
+func (tg *TerrainGenerator) sampleCubedSpherePatch(
+	face CubeFace, fCenter, fUAxis, fVAxis spheroid.Vec3,
+	uMin, uMax, vMin, vMax float64,
+	res int,
+	patchesPerFaceAxis int,
+	stride int,
+) []splat.Splat {
+	cfg := tg.config
+
+	// Physical target metric spacing on the spheroid
+	surfaceArea := 4.0 * math.Pi * cfg.Spheroid.SemiMajorAxis * cfg.Spheroid.SemiMajorAxis
+	patchArea := surfaceArea / float64(6*patchesPerFaceAxis*patchesPerFaceAxis)
+
+	if cfg.AdaptiveDensity {
+		ptsPerSide := float64(res) / float64(stride)
+		if ptsPerSide < 1.0 {
+			ptsPerSide = 1.0
+		}
+		maxDepth := int(math.Round(math.Log2(ptsPerSide)))
+		if maxDepth < 1 {
+			maxDepth = 1
+		}
+		if maxDepth > 8 {
+			maxDepth = 8 // Max 256x256 sub-cells per patch
+		}
+
+		splats := make([]splat.Splat, 0, 128)
+		tg.sampleAdaptiveQuad(
+			face, fCenter, fUAxis, fVAxis,
+			uMin, uMax, vMin, vMax,
+			uMin, uMax, vMin, vMax,
+			0, maxDepth, patchArea,
+			&splats,
+		)
+		return splats
+	}
+
+	// Uniform grid sampling fallback
+	splats := make([]splat.Splat, 0, (res/stride)*(res/stride)+1)
+
+	du := (uMax - uMin) / float64(res)
+	dv := (vMax - vMin) / float64(res)
+
+	ptsPerSide := float64(res) / float64(stride)
+	if ptsPerSide < 1.0 {
+		ptsPerSide = 1.0
+	}
+	splatSpacing := math.Sqrt(patchArea) / ptsPerSide
+
+	for i := 0; i < res; i += stride {
+		// Sample at the centroid of each downsampled grid cell for crisp alignment
+		u := uMin + (float64(i)+float64(stride)*0.5)*du
+
+		for j := 0; j < res; j += stride {
+			v := vMin + (float64(j)+float64(stride)*0.5)*dv
+
+			// Spherify cube coordinates: v_cube = center + u*uAxis + v*vAxis
+			cX := fCenter.X + u*fUAxis.X + v*fVAxis.X
+			cY := fCenter.Y + u*fUAxis.Y + v*fVAxis.Y
+			cZ := fCenter.Z + u*fUAxis.Z + v*fVAxis.Z
+
+			lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+			if lenC < 1e-6 {
+				lenC = 1.0
+			}
+			nX := cX / lenC
+			nY := cY / lenC
+			nZ := cZ / lenC
+
+			// Convert unit sphere normal to Geodetic Latitude & Longitude
+			latRad := math.Asin(math.Max(-1.0, math.Min(1.0, nZ)))
+			lonRad := math.Atan2(nY, nX)
+
+			latDeg := latRad * 180.0 / math.Pi
+			lonDeg := lonRad * 180.0 / math.Pi
+
+			// Sample elevation noise and slopes
+			elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latDeg, lonDeg)
+			height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+
+			// Transform to Oblate Spheroid ECEF Cartesian position
+			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
+
+			// Gaussian Splat Scale: Tangent footprint matching grid spacing
+			sx := float32(0.5 * splatSpacing * cfg.OverlapFactor)
+			sy := float32(0.5 * splatSpacing * cfg.OverlapFactor)
+			sz := float32(0.5 * splatSpacing * cfg.ThicknessFactor)
+
+			// Normal-aligned rotation quaternion
+			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
+
+			// Biome color
+			color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+
+			splats = append(splats, splat.Splat{
+				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
+				Scale:    [3]float32{sx, sy, sz},
+				Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
+				Color:    color,
+			})
+		}
+	}
+
+	return splats
+}
+
+// sampleAdaptiveQuad recursively subdivides a patch quadrant based on local terrain curvature / elevation deviation.
+func (tg *TerrainGenerator) sampleAdaptiveQuad(
+	face CubeFace, fCenter, fUAxis, fVAxis spheroid.Vec3,
+	u0, u1, v0, v1 float64,
+	patchUMin, patchUMax, patchVMin, patchVMax float64,
+	depth, maxDepth int,
+	patchArea float64,
+	splats *[]splat.Splat,
+) {
+	cfg := tg.config
+
+	// Convert coordinates to lat/lon helper
+	toLatLon := func(u, v float64) (float64, float64) {
+		cX := fCenter.X + u*fUAxis.X + v*fVAxis.X
+		cY := fCenter.Y + u*fUAxis.Y + v*fVAxis.Y
+		cZ := fCenter.Z + u*fUAxis.Z + v*fVAxis.Z
+		lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+		if lenC < 1e-6 {
+			lenC = 1.0
+		}
+		latRad := math.Asin(math.Max(-1.0, math.Min(1.0, cZ/lenC)))
+		lonRad := math.Atan2(cY, cX)
+		return latRad * 180.0 / math.Pi, lonRad * 180.0 / math.Pi
+	}
+
+	uMid := (u0 + u1) * 0.5
+	vMid := (v0 + v1) * 0.5
+
+	latMid, lonMid := toLatLon(uMid, vMid)
+	elevMid := tg.sampleHeight(latMid, lonMid)
+
+	// Sample 4 corners
+	lat00, lon00 := toLatLon(u0, v0)
+	lat10, lon10 := toLatLon(u1, v0)
+	lat01, lon01 := toLatLon(u0, v1)
+	lat11, lon11 := toLatLon(u1, v1)
+
+	h00 := tg.sampleHeight(lat00, lon00)
+	h10 := tg.sampleHeight(lat10, lon10)
+	h01 := tg.sampleHeight(lat01, lon01)
+	h11 := tg.sampleHeight(lat11, lon11)
+
+	// Bilinear center approximation
+	hBilinear := (h00 + h10 + h01 + h11) * 0.25
+
+	// Height curvature error in km/units
+	errH := math.Abs(elevMid-hBilinear) * cfg.ElevationScale
+	spanH := math.Max(math.Abs(h00-h11), math.Abs(h10-h01)) * cfg.ElevationScale
+
+	tol := cfg.CurvatureTolerance
+	if tol <= 0 {
+		tol = 0.12 // 120m default tolerance
+	}
+
+	// Subdivide if error exceeds curvature tolerance and not at max depth
+	shouldSubdivide := depth < maxDepth && (errH > tol || (depth < 2 && elevMid > cfg.SeaLevel && spanH > tol*2.5))
+
+	if shouldSubdivide {
+		// Subdivide into 4 child quadrants
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
+		return
+	}
+
+	// Leaf cell: Emit single adaptive splat covering this cell
+	elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latMid, lonMid)
+	height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+	posECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, height)
+
+	// Metric cell spacing proportional to fraction of patch size
+	cellFraction := (u1 - u0) / (patchUMax - patchUMin)
+	cellSpacing := math.Sqrt(patchArea) * cellFraction
+
+	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor)
+	sy := float32(0.5 * cellSpacing * cfg.OverlapFactor)
+	sz := float32(0.5 * cellSpacing * cfg.ThicknessFactor)
+
+	quat := cfg.Spheroid.OrientationQuaternion(latMid, lonMid, slopeE, slopeN)
+	color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+
+	*splats = append(*splats, splat.Splat{
+		Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
+		Scale:    [3]float32{sx, sy, sz},
+		Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
+		Color:    color,
+	})
+}
+
+func computePatchBounds(splats []splat.Splat, s spheroid.Spheroid, fCenter, fUAxis, fVAxis spheroid.Vec3, midU, midV float64) ([3]float32, float32, [3]float32) {
+	if len(splats) == 0 {
+		cX := fCenter.X + midU*fUAxis.X + midV*fVAxis.X
+		cY := fCenter.Y + midU*fUAxis.Y + midV*fVAxis.Y
+		cZ := fCenter.Z + midU*fUAxis.Z + midV*fVAxis.Z
+		lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+		pos := s.GeodeticToECEF(math.Asin(cZ/lenC)*180/math.Pi, math.Atan2(cY, cX)*180/math.Pi, 0)
+		return [3]float32{float32(pos.X), float32(pos.Y), float32(pos.Z)}, 10.0, [3]float32{float32(cX / lenC), float32(cY / lenC), float32(cZ / lenC)}
+	}
+
+	var sumX, sumY, sumZ float64
+	for _, p := range splats {
+		sumX += float64(p.Position[0])
+		sumY += float64(p.Position[1])
+		sumZ += float64(p.Position[2])
+	}
+	n := float64(len(splats))
+	center := [3]float32{float32(sumX / n), float32(sumY / n), float32(sumZ / n)}
+
+	var maxR float64
+	for _, p := range splats {
+		dx := float64(p.Position[0]) - float64(center[0])
+		dy := float64(p.Position[1]) - float64(center[1])
+		dz := float64(p.Position[2]) - float64(center[2])
+		r := math.Sqrt(dx*dx + dy*dy + dz*dz)
+		if r > maxR {
+			maxR = r
+		}
+	}
+
+	// Outward unit normal at patch center
+	cX := fCenter.X + midU*fUAxis.X + midV*fVAxis.X
+	cY := fCenter.Y + midU*fUAxis.Y + midV*fVAxis.Y
+	cZ := fCenter.Z + midU*fUAxis.Z + midV*fVAxis.Z
+	lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+	norm := [3]float32{float32(cX / lenC), float32(cY / lenC), float32(cZ / lenC)}
+
+	return center, float32(maxR * 1.15), norm
+}
