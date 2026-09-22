@@ -12,6 +12,13 @@
         thicknessMultiplier: 0.35,
         alphaBoost: 1.0,
         colorMode: 0,
+        kernelType: 0,          // 0 = Flat-Top Plateau (Solid & Crisp), 1 = Super-Gaussian, 2 = Standard Gaussian
+        sunAzimuth: 45.0,       // Sun angle around horizon (0-360 deg)
+        sunElevation: 35.0,     // Sun altitude above horizon (-10 to 90 deg)
+        sunIntensity: 1.25,     // Direct sunlight intensity
+        ambientIntensity: 0.38, // Hemispheric skylight intensity
+        shadingEnabled: true,   // Dynamic PBR sun lighting & normal shading
+        hazeDensity: 0.50,      // Atmospheric Rayleigh haze density
         showGrid: true,
         depthSort: false,
         lodBias: 1.0,
@@ -76,6 +83,7 @@
     out vec2 v_uv;
     out vec4 v_color;
     out vec3 v_normal;
+    out vec3 v_worldPos;
     out float v_altitude;
 
     // Helper: Quaternion (W,X,Y,Z) to Column-Major Rotation Matrix
@@ -201,7 +209,9 @@
         gl_Position = clipPos;
         v_uv = a_quad; // (-2,-2) to (2,2)
         v_color = a_color;
-        v_normal = normalize(center);
+        // True physical terrain surface normal from slope quaternion
+        v_normal = normalize(R[2]);
+        v_worldPos = center;
         v_altitude = length(center);
     }
     `;
@@ -212,10 +222,18 @@
     in vec2 v_uv;
     in vec4 v_color;
     in vec3 v_normal;
+    in vec3 v_worldPos;
     in float v_altitude;
 
+    uniform vec3 u_camPos;
+    uniform vec3 u_sunDir;
+    uniform float u_sunIntensity;
+    uniform float u_ambientIntensity;
+    uniform float u_hazeDensity;
+    uniform bool u_shadingEnabled;
     uniform float u_alphaBoost;
     uniform int u_colorMode;
+    uniform int u_kernelType;
     uniform float u_spheroidRadius;
 
     out vec4 fragColor;
@@ -233,6 +251,7 @@
     }
 
     void main() {
+        // Radially symmetric 2D Gaussian falloff (invariant to screen-space billboard rotation)
         float d = -0.5 * dot(v_uv, v_uv);
         if (d < -4.5) {
             discard; // Beyond 3 sigma
@@ -243,27 +262,78 @@
             discard;
         }
 
-        vec3 color = v_color.rgb;
+        vec3 baseColor = v_color.rgb;
 
         if (u_colorMode == 1) {
             // Elevation Colormap
             float relH = (v_altitude - u_spheroidRadius) / max(1.0, u_spheroidRadius * 0.1);
-            color = colormapTurbo(relH * 0.8 + 0.2);
+            baseColor = colormapTurbo(relH * 0.8 + 0.2);
         } else if (u_colorMode == 2) {
-            // Normal Vectors
-            color = v_normal * 0.5 + 0.5;
+            // Surface Normals Debug
+            fragColor = vec4((v_normal * 0.5 + 0.5) * alpha, alpha);
+            return;
         } else if (u_colorMode == 3) {
             // Gaussian Footprint Debug
             float ring = fract(length(v_uv) * 1.5);
             if (ring < 0.15 || length(v_uv) > 1.8) {
-                color = vec3(0.0, 1.0, 0.8);
+                baseColor = vec3(0.0, 1.0, 0.8);
             } else {
-                color = v_color.rgb * 0.5;
+                baseColor = v_color.rgb * 0.5;
             }
         }
 
+        // --- High-Frequency Micro-Relief Noise inside Splats ---
+        // Adds subtle procedural rock/strata micro-grain across each wafer
+        float grain1 = sin(v_uv.x * 9.42 + v_uv.y * 6.28) * cos(v_uv.x * 6.28 - v_uv.y * 12.56);
+        float grain2 = sin(v_uv.x * 18.84 - v_uv.y * 15.70) * 0.5;
+        float microRelief = (grain1 + grain2) * 0.065;
+        baseColor = clamp(baseColor * (1.0 + microRelief), 0.0, 1.0);
+
+        if (!u_shadingEnabled && u_colorMode == 0) {
+            fragColor = vec4(baseColor * alpha, alpha);
+            return;
+        }
+
+        // --- Dynamic Sun Lighting & Normal Shading ---
+        vec3 N = normalize(v_normal);
+        vec3 L = normalize(u_sunDir);
+        vec3 V = normalize(u_camPos - v_worldPos);
+
+        // Half-Lambert wrap diffuse for realistic soft mountain penumbra
+        float NdotL = dot(N, L);
+        float wrapDiffuse = clamp((NdotL + 0.20) / 1.20, 0.0, 1.0);
+
+        // Hemispherical Ambient Skylight (cool Rayleigh blue from sky, warm ground bounce)
+        vec3 upNorm = normalize(v_worldPos);
+        float hemi = dot(N, upNorm) * 0.5 + 0.5;
+        vec3 skyAmbient = mix(vec3(0.10, 0.14, 0.22), vec3(0.38, 0.46, 0.58), hemi) * u_ambientIntensity;
+
+        // Direct warm golden sunlight
+        vec3 sunLight = vec3(1.0, 0.95, 0.88) * (wrapDiffuse * u_sunIntensity);
+
+        // Specular Glints on Oceans and Snowcaps
+        vec3 H = normalize(L + V);
+        float NdotH = max(0.0, dot(N, H));
+        float specIntensity = pow(NdotH, 28.0) * 0.22 * max(0.0, NdotL);
+        vec3 specular = vec3(1.0, 0.98, 0.92) * specIntensity;
+
+        vec3 litColor = baseColor * (skyAmbient + sunLight) + specular;
+
+        // --- Atmospheric Rayleigh Scattering & Aerial Perspective ---
+        if (u_hazeDensity > 0.001) {
+            float distToCam = length(u_camPos - v_worldPos);
+            float hazeFactor = 1.0 - exp(-distToCam * 0.0016 * u_hazeDensity);
+            hazeFactor = clamp(hazeFactor, 0.0, 0.85);
+
+            // Sun forward-scattering glow in horizon haze
+            float VdotL = max(0.0, dot(-V, L));
+            vec3 hazeColor = mix(vec3(0.40, 0.56, 0.76), vec3(1.0, 0.82, 0.55), pow(VdotL, 4.0) * 0.65);
+
+            litColor = mix(litColor, hazeColor, hazeFactor);
+        }
+
         // Premultiplied alpha blending
-        fragColor = vec4(color * alpha, alpha);
+        fragColor = vec4(litColor * alpha, alpha);
     }
     `;
 
@@ -1333,7 +1403,21 @@
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_thicknessMult'), state.thicknessMultiplier);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_alphaBoost'), state.alphaBoost);
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_colorMode'), state.colorMode);
+            gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_kernelType'), state.kernelType || 0);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_spheroidRadius'), state.spheroid.radius);
+
+            // Sun Lighting & Atmosphere Uniforms
+            const azRad = (state.sunAzimuth || 45.0) * Math.PI / 180.0;
+            const elRad = (state.sunElevation || 35.0) * Math.PI / 180.0;
+            const sunDirX = Math.cos(elRad) * Math.cos(azRad);
+            const sunDirY = Math.cos(elRad) * Math.sin(azRad);
+            const sunDirZ = Math.sin(elRad);
+
+            gl.uniform3f(gl.getUniformLocation(splatProgram, 'u_sunDir'), sunDirX, sunDirY, sunDirZ);
+            gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_sunIntensity'), state.sunIntensity || 1.25);
+            gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_ambientIntensity'), state.ambientIntensity || 0.38);
+            gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_hazeDensity'), state.hazeDensity || 0.50);
+            gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_shadingEnabled'), state.shadingEnabled ? 1 : 0);
 
             gl.enable(gl.BLEND);
             gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
@@ -1492,9 +1576,49 @@
         }
 
         const selectShading = document.getElementById('select-shading');
-        selectShading.addEventListener('change', (e) => {
-            state.colorMode = parseInt(e.target.value, 10);
-        });
+        if (selectShading) {
+            selectShading.addEventListener('change', (e) => {
+                state.colorMode = parseInt(e.target.value, 10);
+            });
+        }
+
+        const selectKernel = document.getElementById('select-kernel');
+        if (selectKernel) {
+            selectKernel.addEventListener('change', (e) => {
+                state.kernelType = parseInt(e.target.value, 10);
+            });
+        }
+
+        const checkSunShading = document.getElementById('check-sun-shading');
+        if (checkSunShading) {
+            checkSunShading.addEventListener('change', (e) => {
+                state.shadingEnabled = e.target.checked;
+            });
+        }
+
+        const sliderSunAzimuth = document.getElementById('slider-sun-azimuth');
+        if (sliderSunAzimuth) {
+            sliderSunAzimuth.addEventListener('input', (e) => {
+                state.sunAzimuth = parseFloat(e.target.value);
+                document.getElementById('val-sun-azimuth').innerText = state.sunAzimuth.toFixed(0) + '°';
+            });
+        }
+
+        const sliderSunElevation = document.getElementById('slider-sun-elevation');
+        if (sliderSunElevation) {
+            sliderSunElevation.addEventListener('input', (e) => {
+                state.sunElevation = parseFloat(e.target.value);
+                document.getElementById('val-sun-elevation').innerText = state.sunElevation.toFixed(0) + '°';
+            });
+        }
+
+        const sliderHazeDensity = document.getElementById('slider-haze-density');
+        if (sliderHazeDensity) {
+            sliderHazeDensity.addEventListener('input', (e) => {
+                state.hazeDensity = parseFloat(e.target.value);
+                document.getElementById('val-haze-density').innerText = state.hazeDensity.toFixed(2) + 'x';
+            });
+        }
 
         const selectPreset = document.getElementById('select-terrain-preset');
         if (selectPreset) {

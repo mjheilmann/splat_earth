@@ -159,6 +159,42 @@
                 </div>
             </div>
 
+            <!-- Sun Lighting & Atmosphere Section -->
+            <div class="control-group">
+                <label class="group-title">Sun Lighting & Atmosphere</label>
+                
+                <div class="checkbox-control">
+                    <label>
+                        <input type="checkbox" id="check-sun-shading" checked>
+                        <span><b>☀️ Dynamic Sun Shading</b></span>
+                    </label>
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Sun Direction (Azimuth)</span>
+                        <span class="slider-val" id="val-sun-azimuth">45°</span>
+                    </div>
+                    <input type="range" id="slider-sun-azimuth" min="0" max="360" step="5" value="45">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Sun Altitude (Time of Day)</span>
+                        <span class="slider-val" id="val-sun-elevation">35°</span>
+                    </div>
+                    <input type="range" id="slider-sun-elevation" min="-10" max="90" step="2" value="35">
+                </div>
+
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>Atmospheric Haze</span>
+                        <span class="slider-val" id="val-haze-density">0.50x</span>
+                    </div>
+                    <input type="range" id="slider-haze-density" min="0.0" max="2.0" step="0.05" value="0.50">
+                </div>
+            </div>
+
             <!-- Live Generator Stand-In Section -->
             <div class="control-group">
                 <label class="group-title">GIS Stand-In Generator</label>
@@ -235,8 +271,8 @@
 
                 <div class="checkbox-control" style="margin-top: 6px;">
                     <label>
-                        <input type="checkbox" id="check-adaptive-density" checked>
-                        <span><b>⚡ Variable Density (Quadtree Adaptive)</b></span>
+                        <input type="checkbox" id="check-adaptive-density">
+                        <span>⚡ Variable Density (Quadtree Adaptive)</span>
                     </label>
                 </div>
 

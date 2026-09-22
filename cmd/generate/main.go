@@ -8,9 +8,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/myuser/gaussian-splat-app/pkg/spheroid"
-	"github.com/myuser/gaussian-splat-app/pkg/splat"
-	"github.com/myuser/gaussian-splat-app/pkg/terrain"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/terrain"
 )
 
 func main() {

@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/myuser/gaussian-splat-app/pkg/spheroid"
-	"github.com/myuser/gaussian-splat-app/pkg/splat"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
 )
 
 // GeneratorConfig holds configuration for the GIS terrain stand-in generator.
@@ -54,7 +54,7 @@ func DefaultConfig() GeneratorConfig {
 		OverlapFactor:      1.35,
 		ThicknessFactor:    0.035, // Wafer-thin planar discs (~3.5% of cell width) to preserve sharp topography
 		SeaLevel:           0.30,
-		AdaptiveDensity:    true, // Enabled by default for massive scalability
+		AdaptiveDensity:    false, // Disabled by default for seamless artifact-free uniform terrain
 		CurvatureTolerance: 0.12, // 120 meters height deviation tolerance
 	}
 }

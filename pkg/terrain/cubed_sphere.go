@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/myuser/gaussian-splat-app/pkg/spheroid"
-	"github.com/myuser/gaussian-splat-app/pkg/splat"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
 )
 
 // CubeFace represents one of the 6 cardinal faces of a spherified cube.
@@ -95,29 +95,34 @@ func (tg *TerrainGenerator) EstimatePointDensity(totalPoints int) DensityMetrics
 }
 
 // lodTargetResolutions defines the target point count per patch axis for each LOD level.
-// LOD 0 targets native full resolution.
-// LOD 1-4 target fixed resolutions (doubled target budgets) so high-altitude and orbit budgets remain constant and crisp regardless of global density.
-var lodTargetResolutions = [5]int{0, 96, 48, 24, 12}
+// LOD 0 targets max 192x192 (~36k splats/chunk) so close-up ground flight remains rock-solid and never exhausts browser memory.
+// LOD 1-4 target fixed downsampled budgets so high-altitude and orbit rendering remain under 60k splats globally.
+var lodTargetResolutions = [5]int{192, 96, 48, 24, 12}
 
 func computeLODStride(nativeRes int, lod int) int {
 	if lod <= 0 {
-		return 1
+		if nativeRes <= 192 {
+			return 1
+		}
+		return int(math.Max(1, math.Round(float64(nativeRes)/192.0)))
 	}
 	if lod > 4 {
 		lod = 4
 	}
 	targetRes := lodTargetResolutions[lod]
-	if targetRes <= 0 || nativeRes <= targetRes {
-		stride := 1 << lod
-		if stride > nativeRes && nativeRes > 0 {
-			stride = nativeRes
+	stride := 1 << lod
+	if targetRes > 0 && nativeRes > targetRes {
+		targetStride := int(math.Round(float64(nativeRes) / float64(targetRes)))
+		if targetStride > stride {
+			stride = targetStride
 		}
-		if stride < 1 {
-			stride = 1
-		}
-		return stride
 	}
-	stride := int(math.Max(1, math.Round(float64(nativeRes)/float64(targetRes))))
+	if stride > nativeRes && nativeRes > 0 {
+		stride = nativeRes
+	}
+	if stride < 1 {
+		stride = 1
+	}
 	return stride
 }
 

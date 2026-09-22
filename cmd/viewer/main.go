@@ -9,7 +9,7 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/myuser/gaussian-splat-app/pkg/viewer"
+	"github.com/mjheilmann/gaussian-splat-app/pkg/viewer"
 )
 
 func main() {
