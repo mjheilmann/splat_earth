@@ -736,3 +736,52 @@ func computePatchBounds(splats []splat.Splat, s spheroid.Spheroid, fCenter, fUAx
 
 	return center, float32(maxR * 1.15), norm
 }
+
+// WriteContainer generates the full multi-LOD cubed-sphere terrain directly into a compressed indexed container.
+func (tg *TerrainGenerator) WriteContainer(filePath string, patchesPerFaceAxis int) error {
+	procCube := tg.NewProceduralCubedSphere(patchesPerFaceAxis)
+	density := tg.EstimatePointDensity(0)
+
+	header := splat.ContainerHeader{
+		Radius:          tg.config.Spheroid.SemiMajorAxis,
+		Flattening:      tg.config.Spheroid.Flattening,
+		TotalSplatCount: uint64(density.TotalPoints),
+		VirtualPoints:   uint64(density.TotalPoints),
+		MeanSpacingKm:   density.MeanSpacingMeters / 1000.0,
+		ChunkCount:      uint32(procCube.TotalChunks),
+		MaxLODLevels:    5,
+	}
+
+	cw, err := splat.NewContainerWriter(filePath, header)
+	if err != nil {
+		return err
+	}
+
+	for chunkID := 0; chunkID < procCube.TotalChunks; chunkID++ {
+		m := procCube.Manifests[chunkID]
+		cm := splat.ChunkManifest{
+			ChunkID: uint32(m.ID),
+			Center:  m.Center,
+			Radius:  m.Radius,
+			Normal:  m.Normal,
+			LatMin:  -90.0,
+			LatMax:  90.0,
+			LonMin:  -180.0,
+			LonMax:  180.0,
+			LODs:    make([]splat.ChunkLODEntry, 0, 5),
+		}
+
+		for lod := 0; lod < 5; lod++ {
+			splats := procCube.SampleChunkLOD(chunkID, lod)
+			entry, err := cw.WriteChunkLOD(chunkID, uint32(lod), splats)
+			if err != nil {
+				return err
+			}
+			cm.LODs = append(cm.LODs, *entry)
+		}
+
+		cw.AddChunkManifest(cm)
+	}
+
+	return cw.Finalize()
+}

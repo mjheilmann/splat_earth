@@ -26,8 +26,11 @@ func main() {
 	if *filePath != "" {
 		if _, err := os.Stat(*filePath); os.IsNotExist(err) {
 			altPath := filepath.Join("splats", *filePath)
+			worldPath := filepath.Join("splats", "world.splat")
 			if _, altErr := os.Stat(altPath); altErr == nil {
 				*filePath = altPath
+			} else if _, worldErr := os.Stat(worldPath); worldErr == nil {
+				*filePath = worldPath
 			} else {
 				if defaultRaster != "" {
 					fmt.Printf("Note: Splat file '%s' not found. Starting with live Real-World Earth DEM (%s).\n", *filePath, defaultRaster)

@@ -7,9 +7,7 @@ import (
 	"io/fs"
 	"math"
 	"net/http"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 
 	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
@@ -21,15 +19,16 @@ var embeddedFS embed.FS
 
 // Server handles serving the 3D Gaussian splat viewer, chunk manifests, and multi-LOD splat streams.
 type Server struct {
-	mu             sync.RWMutex
-	filePath       string
-	splats         []splat.Splat
-	splatSet       *splat.SplatSet
-	chunkedTerrain *terrain.ChunkedTerrain
-	proceduralCube *terrain.ProceduralCubedSphere
-	chunkCache     map[string][]splat.Splat
-	cacheOrder     []string
-	spheroidInfo   struct {
+	mu              sync.RWMutex
+	filePath        string
+	containerReader *splat.ContainerReader
+	splats          []splat.Splat
+	splatSet        *splat.SplatSet
+	chunkedTerrain  *terrain.ChunkedTerrain
+	proceduralCube  *terrain.ProceduralCubedSphere
+	chunkCache      map[string][]splat.Splat
+	cacheOrder      []string
+	spheroidInfo    struct {
 		Radius     float64 `json:"radius"`
 		Flattening float64 `json:"flattening"`
 	}
@@ -59,16 +58,26 @@ func NewServer(filePath string) (*Server, error) {
 }
 
 func (s *Server) loadFile(path string) error {
-	ext := strings.ToLower(filepath.Ext(path))
-	var splats []splat.Splat
-	var err error
+	if splat.IsContainerFile(path) {
+		cr, err := splat.OpenContainer(path)
+		if err != nil {
+			return fmt.Errorf("failed to open compressed splat container %s: %w", path, err)
+		}
 
-	if ext == ".splat" {
-		splats, err = splat.LoadSplatFile(path)
-	} else {
-		splats, err = splat.LoadSplatFile(path)
+		s.mu.Lock()
+		s.filePath = path
+		s.containerReader = cr
+		s.spheroidInfo.Radius = cr.Header().Radius
+		s.spheroidInfo.Flattening = cr.Header().Flattening
+		s.chunkedTerrain = nil
+		s.proceduralCube = nil
+		s.splats = nil
+		s.splatSet = nil
+		s.mu.Unlock()
+		return nil
 	}
 
+	splats, err := splat.LoadSplatFile(path)
 	if err != nil {
 		return fmt.Errorf("failed to load %s: %w", path, err)
 	}
@@ -90,6 +99,7 @@ func (s *Server) loadFile(path string) error {
 	s.spheroidInfo.Flattening = 0.05
 
 	// Partition loaded splats into a single chunk for compatibility
+	s.containerReader = nil
 	s.chunkedTerrain = nil
 	s.proceduralCube = nil
 	s.mu.Unlock()
@@ -125,7 +135,14 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	chunkCount := 0
 	var boundsMin, boundsMax [3]float32
 
-	if s.proceduralCube != nil {
+	if s.containerReader != nil {
+		h := s.containerReader.Header()
+		totalSplats = int(h.TotalSplatCount)
+		chunkCount = int(h.ChunkCount)
+		R := float32(h.Radius * 1.15)
+		boundsMin = [3]float32{-R, -R, -R}
+		boundsMax = [3]float32{R, R, R}
+	} else if s.proceduralCube != nil {
 		chunkCount = s.proceduralCube.TotalChunks
 		for _, m := range s.proceduralCube.Manifests {
 			totalSplats += m.CountsLOD[0]
@@ -158,7 +175,40 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 	var curvatureTolerance float64
 	var virtualPoints int
 
-	if s.proceduralCube != nil {
+	if s.containerReader != nil {
+		h := s.containerReader.Header()
+		adaptiveDensity = true
+		curvatureTolerance = 0.12
+		virtualPoints = int(h.VirtualPoints)
+		if virtualPoints == 0 {
+			virtualPoints = totalSplats
+		}
+		spacingMeters := h.MeanSpacingKm * 1000.0
+		if spacingMeters <= 0 {
+			spacingMeters = 1000.0
+		}
+		radiusKm := s.spheroidInfo.Radius
+		bKm := radiusKm * (1.0 - s.spheroidInfo.Flattening)
+		surfAreaKm2 := 2.0*3.14159265*radiusKm*radiusKm + 3.14159265*(radiusKm*bKm)
+
+		densityInfo = map[string]interface{}{
+			"totalPoints":               totalSplats,
+			"surfaceAreaKm2":            surfAreaKm2,
+			"splatsPerKm2":              float64(totalSplats) / surfAreaKm2,
+			"meanSpacingMeters":         spacingMeters,
+			"totalChunks":               chunkCount,
+			"splatsPerChunkLOD0":        totalSplats / max(1, chunkCount),
+			"focusEnabled":              true,
+		}
+		focusInfo = map[string]interface{}{
+			"enabled":           true,
+			"centerLat":         47.581,
+			"centerLon":         -122.335,
+			"areaSqMiles":       154.8,
+			"densityMultiplier": 64.0,
+			"transitionWidthKm": 5.0,
+		}
+	} else if s.proceduralCube != nil {
 		cfg := s.proceduralCube.Config
 		adaptiveDensity = cfg.AdaptiveDensity
 		curvatureTolerance = cfg.CurvatureTolerance
@@ -240,6 +290,30 @@ func (s *Server) handleChunks(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-cache")
 
+	if s.containerReader != nil {
+		chunks := s.containerReader.Chunks()
+		manifests := make([]terrain.ChunkManifest, len(chunks))
+		for i, c := range chunks {
+			var counts [5]int
+			for _, lod := range c.LODs {
+				if lod.LODLevel < 5 {
+					counts[lod.LODLevel] = int(lod.SplatCount)
+				}
+			}
+			manifests[i] = terrain.ChunkManifest{
+				ID:        int(c.ChunkID),
+				Center:    c.Center,
+				Radius:    c.Radius,
+				Normal:    c.Normal,
+				CountsLOD: counts,
+			}
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"chunks": manifests,
+		})
+		return
+	}
+
 	if s.proceduralCube != nil {
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"chunks": s.proceduralCube.Manifests,
@@ -290,9 +364,21 @@ func (s *Server) handleChunkBinary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 
 	s.mu.RLock()
+	cr := s.containerReader
 	procCube := s.proceduralCube
 	chunked := s.chunkedTerrain
 	s.mu.RUnlock()
+
+	// Zero-memory direct streaming from disk container
+	if cr != nil {
+		buf, err := cr.ReadChunkLODBytes(uint32(chunkID), uint32(lod))
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Failed to read chunk: %v", err), http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write(buf)
+		return
+	}
 
 	// On-Demand Procedural Chunk Synthesis with LRU Cache (< 30 MB server RAM)
 	if procCube != nil && chunkID >= 0 && chunkID < procCube.TotalChunks {
@@ -338,6 +424,16 @@ func (s *Server) handleSplatBinary(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Disposition", "inline; filename=\"terrain.splat\"")
 	w.Header().Set("Cache-Control", "no-cache")
+
+	if s.containerReader != nil {
+		for _, ch := range s.containerReader.Chunks() {
+			buf, err := s.containerReader.ReadChunkLODBytes(ch.ChunkID, 0)
+			if err == nil {
+				_, _ = w.Write(buf)
+			}
+		}
+		return
+	}
 
 	if s.proceduralCube != nil {
 		for id := 0; id < s.proceduralCube.TotalChunks; id++ {

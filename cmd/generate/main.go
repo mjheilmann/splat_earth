@@ -118,46 +118,55 @@ func main() {
 	}
 
 	startTime := time.Now()
-	fmt.Print("Generating 3D Gaussian splat terrain from heightmap data...")
 	gen := terrain.NewTerrainGenerator(cfg)
-	var splats []splat.Splat
-	if strings.ToLower(*geometry) == "latlon" {
-		splats = gen.Generate()
-	} else {
-		splats = gen.GenerateCubedSphereSplats(*patches)
-	}
-	genDuration := time.Since(startTime)
-	fmt.Printf(" Done (%v) - Generated %d splats\n", genDuration, len(splats))
 
-	// Save file
-	saveStart := time.Now()
 	if parentDir := filepath.Dir(*outFile); parentDir != "" && parentDir != "." {
 		_ = os.MkdirAll(parentDir, 0755)
 	}
-	fmt.Printf("Writing to %s (format: %s)...", *outFile, outFormat)
-	var err error
-	if outFormat == "ply" {
-		err = splat.SavePLYFile(*outFile, splats)
-	} else {
-		err = splat.SaveSplatFile(*outFile, splats)
-	}
-	if err != nil {
-		fmt.Printf("\nError saving file: %v\n", err)
-		os.Exit(1)
-	}
-	saveDuration := time.Since(saveStart)
 
+	if outFormat == "splat" && strings.ToLower(*geometry) != "latlon" {
+		fmt.Printf("Generating compressed indexed multi-LOD splat container directly to %s...\n", *outFile)
+		err := gen.WriteContainer(*outFile, *patches)
+		if err != nil {
+			fmt.Printf("\nError generating container: %v\n", err)
+			os.Exit(1)
+		}
+	} else {
+		fmt.Print("Generating 3D Gaussian splat terrain...")
+		var splats []splat.Splat
+		if strings.ToLower(*geometry) == "latlon" {
+			splats = gen.Generate()
+		} else {
+			splats = gen.GenerateCubedSphereSplats(*patches)
+		}
+		genDuration := time.Since(startTime)
+		fmt.Printf(" Done (%v) - Generated %d splats\n", genDuration, len(splats))
+
+		fmt.Printf("Writing to %s (format: %s)...", *outFile, outFormat)
+		var err error
+		if outFormat == "ply" {
+			err = splat.SavePLYFile(*outFile, splats)
+		} else {
+			err = splat.SaveSplatFile(*outFile, splats)
+		}
+		if err != nil {
+			fmt.Printf("\nError saving file: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	totalDuration := time.Since(startTime)
 	fileInfo, statErr := os.Stat(*outFile)
 	var fileSize int64
 	if statErr == nil {
 		fileSize = fileInfo.Size()
 	}
 
-	fmt.Printf(" Done (%v)\n", saveDuration)
 	fmt.Println("--------------------------------------------------")
 	fmt.Printf("Summary:\n")
-	fmt.Printf(" - Splats Generated: %d\n", len(splats))
+	fmt.Printf(" - Output File: %s\n", *outFile)
 	fmt.Printf(" - File Size: %.2f MB (%d bytes)\n", float64(fileSize)/(1024*1024), fileSize)
-	fmt.Printf(" - Total Time: %v\n", genDuration+saveDuration)
+	fmt.Printf(" - Compression: Enabled (ZLIB/DEFLATE Chunked LOD Streams)\n")
+	fmt.Printf(" - Total Time: %v\n", totalDuration)
 	fmt.Println("==================================================")
 }
