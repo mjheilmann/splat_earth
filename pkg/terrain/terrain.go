@@ -9,7 +9,27 @@ import (
 	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
 )
 
-// GeneratorConfig holds configuration for the GIS terrain stand-in generator.
+// DensityZone defines a steered high-density area of interest (AOI) on the spheroid.
+type DensityZone struct {
+	Enabled           bool    `json:"enabled"`
+	CenterLat         float64 `json:"centerLat"`         // Latitude in degrees (-90 to 90)
+	CenterLon         float64 `json:"centerLon"`         // Longitude in degrees (-180 to 180)
+	AreaSqMiles       float64 `json:"areaSqMiles"`       // Area in square miles (default: 10.0 sq miles)
+	DensityMultiplier float64 `json:"densityMultiplier"` // Density boost factor (e.g. 8.0x - 64.0x)
+	TransitionWidthKm float64 `json:"transitionWidthKm"` // Smooth boundary transition margin in km (0 = auto)
+}
+
+// RadiusKm returns the equivalent circular radius in km for the configured area in square miles.
+func (dz DensityZone) RadiusKm() float64 {
+	areaSqMiles := dz.AreaSqMiles
+	if areaSqMiles <= 0 {
+		areaSqMiles = 10.0
+	}
+	areaSqKm := areaSqMiles * spheroid.SqMilesToSqKm
+	return math.Sqrt(areaSqKm / math.Pi)
+}
+
+// GeneratorConfig holds configuration for the data-driven terrain generator.
 type GeneratorConfig struct {
 	Spheroid spheroid.Spheroid // Reference ellipsoid
 
@@ -22,21 +42,63 @@ type GeneratorConfig struct {
 	StepsLon int // Equator reference resolution for longitude
 
 	ElevationScale  float64 // Max elevation height above ellipsoid (km or units)
-	ElevationOffset float64 // Baseline elevation noise offset (-0.5 to 0.5 to shift land/sea ratio)
+	ElevationOffset float64 // Baseline elevation offset (-0.5 to 0.5)
 	BaseElevation   float64 // Sea level / baseline offset
-	NoiseSeed       int64   // Seed for procedural terrain synthesizer
-	NoiseFrequency  float64 // Spatial frequency of continents/mountains
-	Octaves         int     // Noise detail octaves (e.g. 4-6)
 
 	OverlapFactor      float64 // Splat size overlap multiplier (e.g. 1.25 - 1.4)
-	ThicknessFactor    float64 // Ratio of vertical normal scale to horizontal tangent scale (e.g. 0.15)
+	ThicknessFactor    float64 // Ratio of vertical normal scale to horizontal tangent scale (e.g. 0.035)
 	SeaLevel           float64 // Relative height threshold for water (0.0 - 1.0)
 	AdaptiveDensity    bool    // Enable quadtree curvature-adaptive variable density
-	CurvatureTolerance float64 // Height deviation threshold in km/units to subdivide quad cells (e.g. 0.15 km)
+	CurvatureTolerance float64 // Height deviation threshold in km/units to subdivide quad cells (e.g. 0.12 km)
+
+	RasterPath   string   `json:"rasterPath,omitempty"`   // Path to real-world DEM raster image (e.g. "images/World_elevation_map.png")
+	GeoTIFFPaths []string `json:"geotiffPaths,omitempty"` // Paths to high-resolution local GeoTIFF LiDAR DEMs (e.g. "images/USGS_1M_*.tif")
+
+	FocusArea  DensityZone   `json:"focusArea"`  // Primary steered high-density area of interest
+	FocusAreas []DensityZone `json:"focusAreas"` // Optional multiple steered focus areas
+}
+
+// ActiveFocusAreas returns a slice of all currently enabled focus zones.
+func (cfg *GeneratorConfig) ActiveFocusAreas() []DensityZone {
+	var active []DensityZone
+	if cfg.FocusArea.Enabled {
+		active = append(active, cfg.FocusArea)
+	}
+	for _, fa := range cfg.FocusAreas {
+		if fa.Enabled {
+			active = append(active, fa)
+		}
+	}
+	return active
 }
 
 // DefaultConfig returns parameters for a complete oblate spheroid terrain.
 func DefaultConfig() GeneratorConfig {
+	rasterPath := FindDefaultElevationRaster()
+	geoTIFFs := FindDefaultGeoTIFFs()
+
+	seaLevel := 0.30
+	if rasterPath != "" || len(geoTIFFs) > 0 {
+		seaLevel = 143.0 / 255.0 // ~0.5607 sea level in World_elevation_map.png
+	}
+
+	focusArea := DensityZone{
+		Enabled:           false,
+		CenterLat:         0.0,
+		CenterLon:         0.0,
+		AreaSqMiles:       10.0,
+		DensityMultiplier: 64.0,
+		TransitionWidthKm: 0.0,
+	}
+
+	// Auto-configure focus area to match GeoTIFF bounds if LiDAR files are detected
+	if len(geoTIFFs) > 0 {
+		focusArea.CenterLat = 47.581
+		focusArea.CenterLon = -122.335
+		focusArea.AreaSqMiles = 154.0 // ~400 km2 Seattle mosaic
+		focusArea.DensityMultiplier = 64.0
+	}
+
 	return GeneratorConfig{
 		Spheroid:           spheroid.NewSpheroid(100.0, 0.05), // Scaled spheroid: radius 100, 5% flattening
 		LatMin:             -90.0,
@@ -48,24 +110,63 @@ func DefaultConfig() GeneratorConfig {
 		ElevationScale:     12.0, // High relief mountains up to 12 km
 		ElevationOffset:    0.0,
 		BaseElevation:      0.0,
-		NoiseSeed:          42,
-		NoiseFrequency:     1.8,
-		Octaves:            6,
 		OverlapFactor:      1.35,
-		ThicknessFactor:    0.035, // Wafer-thin planar discs (~3.5% of cell width) to preserve sharp topography
-		SeaLevel:           0.30,
-		AdaptiveDensity:    false, // Disabled by default for seamless artifact-free uniform terrain
-		CurvatureTolerance: 0.12, // 120 meters height deviation tolerance
+		ThicknessFactor:    0.035, // Wafer-thin planar discs (~3.5% of cell width)
+		SeaLevel:           seaLevel,
+		AdaptiveDensity:    false,
+		CurvatureTolerance: 0.12,
+		RasterPath:         rasterPath,
+		GeoTIFFPaths:       geoTIFFs,
+		FocusArea:          focusArea,
+		FocusAreas:         nil,
 	}
 }
 
 // TerrainGenerator generates 3D Gaussian Splats over an oblate spheroid.
 type TerrainGenerator struct {
-	config GeneratorConfig
-	noise  *PerlinNoise
+	config  GeneratorConfig
+	raster  *ElevationRaster
+	geoTIFF *GeoTIFFMosaic
 }
 
-// NewTerrainGenerator initializes a new terrain generator.
+// GetDensityMultiplier returns the steered density boost factor at (lat, lon).
+func (tg *TerrainGenerator) GetDensityMultiplier(lat, lon float64) float64 {
+	activeZones := tg.config.ActiveFocusAreas()
+	if len(activeZones) == 0 {
+		return 1.0
+	}
+
+	maxMult := 1.0
+	for _, zone := range activeZones {
+		mult := zone.DensityMultiplier
+		if mult < 1.0 {
+			mult = 1.0
+		}
+		radius := zone.RadiusKm()
+		trans := zone.TransitionWidthKm
+		if trans <= 0 {
+			trans = math.Max(0.5, radius*0.5)
+		}
+
+		dist := tg.config.Spheroid.SurfaceDistance(lat, lon, zone.CenterLat, zone.CenterLon)
+		if dist <= radius {
+			if mult > maxMult {
+				maxMult = mult
+			}
+		} else if dist < radius+trans {
+			t := (dist - radius) / trans
+			// Cosine smooth falloff
+			w := 0.5 * (1.0 + math.Cos(math.Pi*t))
+			val := 1.0 + (mult-1.0)*w
+			if val > maxMult {
+				maxMult = val
+			}
+		}
+	}
+	return maxMult
+}
+
+// NewTerrainGenerator initializes a new data-driven terrain generator.
 func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 	if cfg.OverlapFactor <= 0 {
 		cfg.OverlapFactor = 1.35
@@ -79,19 +180,40 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 	if cfg.StepsLon < 2 {
 		cfg.StepsLon = 2
 	}
-	if cfg.Octaves < 1 {
-		cfg.Octaves = 4
+
+	var raster *ElevationRaster
+	rasterPath := cfg.RasterPath
+	if rasterPath == "" {
+		rasterPath = FindDefaultElevationRaster()
+	}
+
+	if rasterPath != "" {
+		if r, err := LoadElevationRaster(rasterPath); err == nil {
+			raster = r
+			if cfg.SeaLevel == 0.30 || cfg.SeaLevel == 0.0 {
+				cfg.SeaLevel = 143.0 / 255.0 // ~0.5607 true sea level in standard DEM
+			}
+		}
+	}
+
+	var geoTIFF *GeoTIFFMosaic
+	geoTIFFPaths := cfg.GeoTIFFPaths
+	if len(geoTIFFPaths) == 0 {
+		geoTIFFPaths = FindDefaultGeoTIFFs()
+	}
+	if len(geoTIFFPaths) > 0 {
+		if m, err := LoadGeoTIFFMosaic(geoTIFFPaths); err == nil {
+			geoTIFF = m
+		}
 	}
 
 	return &TerrainGenerator{
-		config: cfg,
-		noise:  NewPerlinNoise(cfg.NoiseSeed),
+		config:  cfg,
+		raster:  raster,
+		geoTIFF: geoTIFF,
 	}
 }
 
-// Generate creates a slice of 3D Gaussian Splats using Equal-Area adaptive sampling.
-// This ensures uniform spatial resolution across the entire spheroid, eliminating polar bunching
-// and concentric ring artifacts.
 // Generate creates a slice of 3D Gaussian Splats using Equal-Area adaptive sampling.
 // Splat generation is parallelized across all CPU cores.
 func (tg *TerrainGenerator) Generate() []splat.Splat {
@@ -183,9 +305,12 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 					height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
 					posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
 
-					sx := float32(0.5 * dEastMeters * cfg.OverlapFactor)
-					sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor)
-					sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor)
+					localDensity := tg.GetDensityMultiplier(lat, lon)
+					scaleFactor := 1.0 / math.Sqrt(localDensity)
+
+					sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * scaleFactor)
+					sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * scaleFactor)
+					sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor * scaleFactor)
 
 					quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE, slopeN)
 					color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
@@ -215,7 +340,7 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 	return splats
 }
 
-// sampleElevationAndSlopes samples elevation noise and central-difference slope gradients in physical metric units (dh/dx, dh/dy).
+// sampleElevationAndSlopes samples elevation data and central-difference slope gradients in physical metric units (dh/dx, dh/dy).
 func (tg *TerrainGenerator) sampleElevationAndSlopes(lat, lon float64) (elev, slopeE, slopeN float64) {
 	delta := 0.05 // Small angular delta (in degrees) for sharp alpine slope gradient calculation
 	deltaRad := delta * math.Pi / 180.0
@@ -244,60 +369,35 @@ func (tg *TerrainGenerator) sampleElevationAndSlopes(lat, lon float64) (elev, sl
 	return eCenter, slopeE, slopeN
 }
 
-// sampleHeight evaluates fractal elevation in [0, 1] using spherical coordinates to avoid seam distortion.
+// sampleHeight evaluates elevation in [0, 1] from high-resolution GeoTIFF LiDAR DEMs or the global heightmap.
 func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
-	latRad := lat * math.Pi / 180.0
-	lonRad := lon * math.Pi / 180.0
-
-	// 3D coordinates on unit sphere for seamless planetary sampling
-	nx := math.Cos(latRad) * math.Cos(lonRad)
-	ny := math.Cos(latRad) * math.Sin(lonRad)
-	nz := math.Sin(latRad)
-
-	// 1. Crustal Domain Warping: Creates realistic curved tectonic belts, archipelagos & fjords
-	wx, wy, wz := tg.noise.DomainWarp(nx, ny, nz, 0.28)
-
-	freq := tg.config.NoiseFrequency
-
-	// 2. Continental Plate Macro-Topology
-	continental := tg.noise.FBM(wx*freq, wy*freq, wz*freq, 4, 0.52, 2.02)
-	continental = (continental + 1.0) * 0.5 // Map to [0, 1]
-
-	var height float64
 	sea := tg.config.SeaLevel
 
-	if continental > sea {
-		// Landmass
-		upland := (continental - sea) / (1.0 - sea) // [0, 1] relative land elevation
-
-		// 3. Alpine Mountain Ranges: Sharp ridge noise & knife-edge peaks
-		alpineRange := tg.noise.AlpineRidgeNoise(wx*freq*2.8+11.3, wy*freq*2.8+5.7, wz*freq*2.8+19.1, 4, 0.58, 2.15)
-		secondaryRidge := tg.noise.RidgeNoise(nx*freq*5.2+3.1, ny*freq*5.2+7.9, nz*freq*5.2+1.4, 4, 0.50, 2.1)
-
-		// 4. Glacial Valleys / Canyons (carved negative troughs)
-		canyonNoise := 1.0 - math.Abs(tg.noise.Noise3D(nx*freq*4.0+13.7, ny*freq*4.0+8.1, nz*freq*4.0+22.4))
-		canyonTrough := canyonNoise * canyonNoise * 0.12
-
-		// 5. Rolling Foothills & Hills
-		foothills := tg.noise.BillowNoise(nx*freq*3.5, ny*freq*3.5, nz*freq*3.5, 3, 0.48, 2.0)
-
-		// 6. Close-Up Micro-Relief (boulders, cliffs, micro-ridges)
-		microRelief := tg.noise.Noise3D(nx*freq*18.0, ny*freq*18.0, nz*freq*18.0) * 0.025
-
-		// Combine layers with upland weighting (mountains rise highest in interior continental highlands)
-		mountainHeight := (alpineRange*0.75 + secondaryRidge*0.25) * math.Pow(upland, 0.8) * 1.15
-		height = sea + upland*0.35 + mountainHeight + foothills*0.12 - canyonTrough + microRelief
-	} else {
-		// Ocean Basin: Deep trenches and continental shelves
-		oceanDepth := continental / sea // [0, 1] from abyssal deep to shore
-		trenchNoise := tg.noise.RidgeNoise(nx*freq*2.0, ny*freq*2.0, nz*freq*2.0, 3, 0.5, 2.0) * 0.08
-		height = oceanDepth*sea - trenchNoise
+	// 1. High-Resolution GeoTIFF LiDAR DEM layer (e.g. 1-meter USGS King County)
+	if tg.geoTIFF != nil {
+		if elevMeters, ok := tg.geoTIFF.Sample(lat, lon); ok {
+			if elevMeters >= 0 {
+				// Above sea level: map [0, 8848m] -> [seaLevel, 1.0]
+				hNorm := sea + (elevMeters/8848.0)*(1.0-sea)
+				return clampFloat(hNorm, 0.0, 1.0)
+			} else {
+				// Below sea level: map [-11000m, 0m] -> [0.0, seaLevel]
+				hNorm := sea + (elevMeters/11000.0)*sea
+				return clampFloat(hNorm, 0.0, 1.0)
+			}
+		}
 	}
 
-	return clampFloat(height, 0.0, 1.0)
+	// 2. Global DEM heightmap layer
+	if tg.raster != nil {
+		return tg.raster.Sample(lat, lon)
+	}
+
+	// Default baseline elevation if no raster loaded
+	return 0.5607
 }
 
-// computeBiomeColor maps elevation and slope to terrain colors.
+// computeBiomeColor maps elevation and slope to satellite-realistic terrain colors.
 func (tg *TerrainGenerator) computeBiomeColor(elev, slopeE, slopeN float64) [4]uint8 {
 	elev = clampFloat(elev, 0.0, 1.0)
 	slopeMag := math.Sqrt(slopeE*slopeE + slopeN*slopeN)
@@ -305,6 +405,11 @@ func (tg *TerrainGenerator) computeBiomeColor(elev, slopeE, slopeN float64) [4]u
 
 	var r, g, b float64
 	alpha := uint8(255)
+
+	landSpan := 1.0 - sea
+	if landSpan < 0.05 {
+		landSpan = 0.05
+	}
 
 	if elev < sea*0.65 {
 		// Deep Abyssal Trench
@@ -318,30 +423,30 @@ func (tg *TerrainGenerator) computeBiomeColor(elev, slopeE, slopeN float64) [4]u
 		r = lerpFloat(t, 20, 40)
 		g = lerpFloat(t, 65, 145)
 		b = lerpFloat(t, 140, 185)
-	} else if elev < sea+0.035 {
-		// Sandy Beaches & Dunes
+	} else if elev < sea+landSpan*0.04 {
+		// Sandy Beaches & Coastal Plains
 		r, g, b = 218, 202, 150
-	} else if elev < sea+0.22 {
+	} else if elev < sea+landSpan*0.28 {
 		// Lush Lowland Plains & Forests
-		t := (elev - (sea + 0.035)) / 0.185
+		t := (elev - (sea + landSpan*0.04)) / (landSpan * 0.24)
 		r = lerpFloat(t, 45, 65)
 		g = lerpFloat(t, 145, 125)
 		b = lerpFloat(t, 45, 40)
-	} else if elev < sea+0.42 {
-		// Subalpine Woodlands & Foothills
-		t := (elev - (sea + 0.22)) / 0.20
+	} else if elev < sea+landSpan*0.55 {
+		// Subalpine Woodlands & Highlands
+		t := (elev - (sea + landSpan*0.28)) / (landSpan * 0.27)
 		r = lerpFloat(t, 65, 95)
 		g = lerpFloat(t, 125, 110)
 		b = lerpFloat(t, 40, 65)
-	} else if elev < sea+0.62 {
-		// Craggy Mountain Slopes & Scree
-		t := (elev - (sea + 0.42)) / 0.20
+	} else if elev < sea+landSpan*0.80 {
+		// Mountain Slopes, Scree & High Ridges
+		t := (elev - (sea + landSpan*0.55)) / (landSpan * 0.25)
 		r = lerpFloat(t, 95, 140)
 		g = lerpFloat(t, 110, 135)
 		b = lerpFloat(t, 65, 130)
 	} else {
-		// Glacial Snowcaps, Horns & Icefields
-		t := (elev - (sea + 0.62)) / (1.0 - (sea + 0.62))
+		// Glacial Snowcaps, Horns & Icefields (Everest, Greenland, Antarctica)
+		t := (elev - (sea + landSpan*0.80)) / (landSpan * 0.20)
 		if t > 1.0 {
 			t = 1.0
 		}

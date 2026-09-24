@@ -84,3 +84,26 @@ func TestOrientationQuaternion(t *testing.T) {
 		t.Errorf("Quaternion not normalized: %v (length %v)", q, lenQ)
 	}
 }
+
+func TestSurfaceDistance(t *testing.T) {
+	s := NewSpheroid(100.0, 0.0) // Sphere radius 100
+	// 90 degrees on equator = (pi/2) * 100 = 157.0796
+	dist := s.SurfaceDistance(0, 0, 0, 90)
+	expected := (math.Pi / 2.0) * 100.0
+	if math.Abs(dist-expected) > 0.1 {
+		t.Errorf("SurfaceDistance equator 90 deg: got %v, want %v", dist, expected)
+	}
+
+	// 0 distance between same point
+	distZero := s.SurfaceDistance(25, 45, 25, 45)
+	if distZero > 1e-6 {
+		t.Errorf("SurfaceDistance same point: got %v, want 0", distZero)
+	}
+
+	// Small distance (e.g. 10 sq miles radius ~ 2.87 km)
+	distSmall := s.SurfaceDistance(0, 0, 0, 0.1)
+	expectedSmall := (0.1 * math.Pi / 180.0) * 100.0
+	if math.Abs(distSmall-expectedSmall) > 0.01 {
+		t.Errorf("SurfaceDistance small delta: got %v, want %v", distSmall, expectedSmall)
+	}
+}

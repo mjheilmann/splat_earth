@@ -5,13 +5,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
 	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
 	"github.com/mjheilmann/gaussian-splat-app/pkg/terrain"
 )
@@ -35,7 +35,7 @@ type Server struct {
 	}
 }
 
-// NewServer initializes a viewer server with a splat file path.
+// NewServer initializes a viewer server with a splat file path or heightmap data source.
 func NewServer(filePath string) (*Server, error) {
 	s := &Server{
 		filePath: filePath,
@@ -46,7 +46,7 @@ func NewServer(filePath string) (*Server, error) {
 			return nil, err
 		}
 	} else {
-		// Generate default initial terrain with on-demand procedural cubed-sphere manifests (<1 MB RAM)
+		// Generate default initial terrain from heightmap data (<1 MB RAM)
 		cfg := terrain.DefaultConfig()
 		gen := terrain.NewTerrainGenerator(cfg)
 		s.proceduralCube = gen.NewProceduralCubedSphere(4)
@@ -106,7 +106,6 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("/api/chunks", s.handleChunks)
 	mux.HandleFunc("/api/chunk", s.handleChunkBinary)
 	mux.HandleFunc("/api/splat", s.handleSplatBinary)
-	mux.HandleFunc("/api/generate", s.handleGenerate)
 
 	// Embedded web static assets
 	sub, err := fs.Sub(embeddedFS, "embedded")
@@ -150,55 +149,98 @@ func (s *Server) handleMeta(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	cfg := terrain.DefaultConfig()
-	cfg.Spheroid = spheroid.NewSpheroid(s.spheroidInfo.Radius, s.spheroidInfo.Flattening)
-	gen := terrain.NewTerrainGenerator(cfg)
-	density := gen.EstimatePointDensity(totalSplats)
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
 
-	virtualPoints := totalSplats
-	adaptivePoints := totalSplats
-	isAdaptive := true
-	curvTol := 0.12
+	var densityInfo interface{}
+	var focusInfo interface{}
+	var adaptiveDensity bool
+	var curvatureTolerance float64
+	var virtualPoints int
 
 	if s.proceduralCube != nil {
-		virtualPoints = s.proceduralCube.Config.StepsLat * s.proceduralCube.Config.StepsLon
-		isAdaptive = s.proceduralCube.Config.AdaptiveDensity
-		curvTol = s.proceduralCube.Config.CurvatureTolerance
-		if isAdaptive {
-			// Ocean and plain regions collapse to large splats, active splats are ~20-25% of uniform grid
-			adaptivePoints = int(float64(totalSplats) * 0.22)
-			if adaptivePoints < s.proceduralCube.TotalChunks*4 {
-				adaptivePoints = s.proceduralCube.TotalChunks * 4
-			}
+		cfg := s.proceduralCube.Config
+		adaptiveDensity = cfg.AdaptiveDensity
+		curvatureTolerance = cfg.CurvatureTolerance
+		virtualPoints = cfg.StepsLat * cfg.StepsLon
+		focusInfo = cfg.FocusArea
+
+		radiusKm := s.spheroidInfo.Radius
+		bKm := radiusKm * (1.0 - s.spheroidInfo.Flattening)
+		surfAreaKm2 := 2.0*3.14159265*radiusKm*radiusKm + 3.14159265*(radiusKm*bKm)
+		spacingMeters := 0.0
+		if totalSplats > 0 {
+			spacingMeters = 1000.0 * math.Sqrt(surfAreaKm2/float64(totalSplats))
+		}
+		densityInfo = map[string]interface{}{
+			"totalPoints":               totalSplats,
+			"surfaceAreaKm2":            surfAreaKm2,
+			"splatsPerKm2":              float64(totalSplats) / surfAreaKm2,
+			"meanSpacingMeters":         spacingMeters,
+			"recommendedPatchesPerFace": s.proceduralCube.PatchesPerFaceAxis,
+			"totalChunks":               s.proceduralCube.TotalChunks,
+			"splatsPerChunkLOD0":        totalSplats / s.proceduralCube.TotalChunks,
+			"focusEnabled":              cfg.FocusArea.Enabled,
+		}
+	} else {
+		adaptiveDensity = true
+		curvatureTolerance = 0.12
+		virtualPoints = totalSplats
+		radiusKm := s.spheroidInfo.Radius
+		bKm := radiusKm * (1.0 - s.spheroidInfo.Flattening)
+		surfAreaKm2 := 2.0*3.14159265*radiusKm*radiusKm + 3.14159265*(radiusKm*bKm)
+		spacingMeters := 0.0
+		if totalSplats > 0 {
+			spacingMeters = 1000.0 * math.Sqrt(surfAreaKm2/float64(totalSplats))
+		}
+		densityInfo = map[string]interface{}{
+			"totalPoints":               totalSplats,
+			"surfaceAreaKm2":            surfAreaKm2,
+			"splatsPerKm2":              float64(totalSplats) / surfAreaKm2,
+			"meanSpacingMeters":         spacingMeters,
+			"recommendedPatchesPerFace": 2,
+			"totalChunks":               24,
+			"splatsPerChunkLOD0":        totalSplats / 24,
+			"focusEnabled":              false,
+		}
+		focusInfo = map[string]interface{}{
+			"enabled":           false,
+			"centerLat":         0.0,
+			"centerLon":         0.0,
+			"areaSqMiles":       0.0,
+			"densityMultiplier": 0.0,
+			"transitionWidthKm": 0.0,
 		}
 	}
 
-	meta := map[string]interface{}{
+	json.NewEncoder(w).Encode(map[string]interface{}{
 		"splatCount":         totalSplats,
 		"virtualPoints":      virtualPoints,
-		"adaptivePoints":     adaptivePoints,
-		"adaptiveDensity":    isAdaptive,
-		"curvatureTolerance": curvTol,
 		"chunkCount":         chunkCount,
-		"byteSize":           totalSplats * splat.SplatByteSize,
+		"adaptiveDensity":    adaptiveDensity,
+		"curvatureTolerance": curvatureTolerance,
+		"density":            densityInfo,
+		"focusArea":          focusInfo,
+		"byteSize":           totalSplats * 32,
 		"bounds": map[string]interface{}{
 			"min": boundsMin,
 			"max": boundsMax,
 		},
-		"spheroid": s.spheroidInfo,
-		"density":  density,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(meta)
+		"spheroid": map[string]interface{}{
+			"radius":     s.spheroidInfo.Radius,
+			"flattening": s.spheroidInfo.Flattening,
+		},
+	})
 }
 
 func (s *Server) handleChunks(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-cache")
+
 	if s.proceduralCube != nil {
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"chunks": s.proceduralCube.Manifests,
 		})
@@ -206,25 +248,26 @@ func (s *Server) handleChunks(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if s.chunkedTerrain != nil {
-		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"chunks": s.chunkedTerrain.Manifests,
 		})
 		return
 	}
 
-	// Fallback single chunk manifest
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"chunks": []terrain.ChunkManifest{
-			{
-				ID:        0,
-				Center:    [3]float32{0, 0, 0},
-				Radius:    float32(s.spheroidInfo.Radius * 1.5),
-				Normal:    [3]float32{0, 0, 1},
-				CountsLOD: [5]int{len(s.splats), len(s.splats), len(s.splats), len(s.splats), len(s.splats)},
-			},
+	// Fallback for flat non-chunked splat files: expose 1 single virtual chunk covering entire model
+	radius := float32(s.spheroidInfo.Radius * 1.5)
+	counts := [5]int{len(s.splats), len(s.splats), len(s.splats), len(s.splats), len(s.splats)}
+	fallbackManifests := []terrain.ChunkManifest{
+		{
+			ID:        0,
+			Center:    [3]float32{0, 0, 0},
+			Radius:    radius,
+			Normal:    [3]float32{0, 0, 1},
+			CountsLOD: counts,
 		},
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"chunks": fallbackManifests,
 	})
 }
 
@@ -232,9 +275,14 @@ func (s *Server) handleChunkBinary(w http.ResponseWriter, r *http.Request) {
 	chunkIDStr := r.URL.Query().Get("id")
 	lodStr := r.URL.Query().Get("lod")
 
-	chunkID, _ := strconv.Atoi(chunkIDStr)
-	lod, _ := strconv.Atoi(lodStr)
-	if lod < 0 || lod > 4 {
+	chunkID, err := strconv.Atoi(chunkIDStr)
+	if err != nil {
+		http.Error(w, "Invalid chunk ID", http.StatusBadRequest)
+		return
+	}
+
+	lod, err := strconv.Atoi(lodStr)
+	if err != nil || lod < 0 || lod > 4 {
 		lod = 0
 	}
 
@@ -267,26 +315,20 @@ func (s *Server) handleChunkBinary(w http.ResponseWriter, r *http.Request) {
 		}
 		s.mu.Unlock()
 
-		if err := splat.WriteSplat(w, splats); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		_ = splat.WriteSplat(w, splats)
 		return
 	}
 
 	if chunked != nil && chunkID >= 0 && chunkID < len(chunked.Chunks) {
 		splats := chunked.Chunks[chunkID].LODs[lod]
-		if err := splat.WriteSplat(w, splats); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
+		_ = splat.WriteSplat(w, splats)
 		return
 	}
 
 	// Fallback to full splats
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if err := splat.WriteSplat(w, s.splats); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
+	_ = splat.WriteSplat(w, s.splats)
 }
 
 func (s *Server) handleSplatBinary(w http.ResponseWriter, r *http.Request) {
@@ -301,7 +343,6 @@ func (s *Server) handleSplatBinary(w http.ResponseWriter, r *http.Request) {
 		for id := 0; id < s.proceduralCube.TotalChunks; id++ {
 			splats := s.proceduralCube.SampleChunkLOD(id, 0)
 			if err := splat.WriteSplat(w, splats); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
 				return
 			}
 		}
@@ -310,160 +351,14 @@ func (s *Server) handleSplatBinary(w http.ResponseWriter, r *http.Request) {
 
 	if s.chunkedTerrain != nil {
 		for _, ch := range s.chunkedTerrain.Chunks {
-			if err := splat.WriteSplat(w, ch.LODs[0]); err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+			if len(ch.LODs) > 0 {
+				if err := splat.WriteSplat(w, ch.LODs[0]); err != nil {
+					return
+				}
 			}
 		}
 		return
 	}
 
-	if err := splat.WriteSplat(w, s.splats); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-	}
-}
-
-type GenerateRequest struct {
-	GeometryType    string  `json:"geometryType"` // "cubed-sphere" (default) or "latlon"
-	PatchesPerFace  int     `json:"patchesPerFace"`
-	Radius          float64 `json:"radius"`
-	Flattening      float64 `json:"flattening"`
-	LatMin          float64 `json:"latMin"`
-	LatMax          float64 `json:"latMax"`
-	LonMin          float64 `json:"lonMin"`
-	LonMax          float64 `json:"lonMax"`
-	StepsLat        int     `json:"stepsLat"`
-	StepsLon        int     `json:"stepsLon"`
-	ElevationScale  float64 `json:"elevationScale"`
-	ElevationOffset float64 `json:"elevationOffset"`
-	NoiseSeed       int64   `json:"noiseSeed"`
-	NoiseFrequency  float64 `json:"noiseFrequency"`
-	Octaves         int     `json:"octaves"`
-	OverlapFactor      float64 `json:"overlapFactor"`
-	ThicknessFactor    float64 `json:"thicknessFactor"`
-	SeaLevel           float64 `json:"seaLevel"`
-	AdaptiveDensity    bool    `json:"adaptiveDensity"`
-	CurvatureTolerance float64 `json:"curvatureTolerance"`
-	ChunkRows          int     `json:"chunkRows"`
-	ChunkCols          int     `json:"chunkCols"`
-}
-
-func (s *Server) handleGenerate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	var req GenerateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON: "+err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	if req.Radius <= 0 {
-		req.Radius = 100.0
-	}
-	if req.StepsLat < 4 {
-		req.StepsLat = 150
-	}
-	if req.StepsLon < 4 {
-		req.StepsLon = 300
-	}
-	if req.OverlapFactor <= 0 {
-		req.OverlapFactor = 1.35
-	}
-	if req.ThicknessFactor <= 0 {
-		req.ThicknessFactor = 0.035
-	}
-	if req.NoiseFrequency <= 0 {
-		req.NoiseFrequency = 1.5
-	}
-	if req.Octaves <= 0 {
-		req.Octaves = 5
-	}
-	if req.ChunkRows <= 0 {
-		req.ChunkRows = 8
-	}
-	if req.ChunkCols <= 0 {
-		req.ChunkCols = 16
-	}
-	if req.CurvatureTolerance <= 0 {
-		req.CurvatureTolerance = 0.12
-	}
-
-	cfg := terrain.GeneratorConfig{
-		Spheroid:           spheroid.NewSpheroid(req.Radius, req.Flattening),
-		LatMin:             req.LatMin,
-		LatMax:             req.LatMax,
-		LonMin:             req.LonMin,
-		LonMax:             req.LonMax,
-		StepsLat:           req.StepsLat,
-		StepsLon:           req.StepsLon,
-		ElevationScale:     req.ElevationScale,
-		ElevationOffset:    req.ElevationOffset,
-		BaseElevation:      0.0,
-		NoiseSeed:          req.NoiseSeed,
-		NoiseFrequency:     req.NoiseFrequency,
-		Octaves:            req.Octaves,
-		OverlapFactor:      req.OverlapFactor,
-		ThicknessFactor:    req.ThicknessFactor,
-		SeaLevel:           0.30,
-		AdaptiveDensity:    req.AdaptiveDensity,
-		CurvatureTolerance: req.CurvatureTolerance,
-	}
-
-	gen := terrain.NewTerrainGenerator(cfg)
-
-	if req.GeometryType == "latlon" {
-		chunked := gen.GenerateChunkedTerrain(req.ChunkRows, req.ChunkCols)
-		totalCount := 0
-		for _, m := range chunked.Manifests {
-			totalCount += m.CountsLOD[0]
-		}
-
-		s.mu.Lock()
-		s.chunkedTerrain = chunked
-		s.proceduralCube = nil
-		s.splats = nil
-		s.splatSet = nil
-		s.spheroidInfo.Radius = req.Radius
-		s.spheroidInfo.Flattening = req.Flattening
-		s.mu.Unlock()
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"success":    true,
-			"splatCount": totalCount,
-			"chunkCount": len(chunked.Chunks),
-		})
-		return
-	}
-
-	// Default: Instant Procedural Cubed Sphere (<1 MB RAM, instant generation for billions of splats!)
-	procCube := gen.NewProceduralCubedSphere(req.PatchesPerFace)
-	totalCount := 0
-	for _, m := range procCube.Manifests {
-		totalCount += m.CountsLOD[0]
-	}
-
-	s.mu.Lock()
-	s.proceduralCube = procCube
-	s.chunkedTerrain = nil
-	s.splats = nil
-	s.splatSet = nil
-	s.chunkCache = make(map[string][]splat.Splat)
-	s.cacheOrder = nil
-	s.spheroidInfo.Radius = req.Radius
-	s.spheroidInfo.Flattening = req.Flattening
-	s.mu.Unlock()
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success":            true,
-		"splatCount":         totalCount,
-		"virtualPoints":      req.StepsLat * req.StepsLon,
-		"chunkCount":         procCube.TotalChunks,
-		"adaptiveDensity":    req.AdaptiveDensity,
-		"curvatureTolerance": req.CurvatureTolerance,
-	})
+	_ = splat.WriteSplat(w, s.splats)
 }

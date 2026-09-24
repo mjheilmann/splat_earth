@@ -29,17 +29,17 @@
         chunkManifests: [],
         activeChunksCount: 0,
         camera: {
-            pos: [0, -240, 120],
+            pos: [0, -204, 120],
             target: [0, 0, 0],
-            quat: [1, 0, 0, 0], // Camera orientation quaternion [w, x, y, z] for 6-DOF flight
+            quat: [0.86816, 0.49624, 0.0, 0.0], // Initialized looking directly at planet center (0,0,0)
             yaw: Math.PI * 0.5,
             pitch: -0.45,
-            orbitDistance: 250,
+            orbitDistance: 240,
             orbitTheta: 0,
             orbitPhi: 0.45,
             fov: 60 * Math.PI / 180,
-            near: 0.001,
-            far: 1000000.0,
+            near: 0.01,
+            far: 1000.0,
         },
         keys: {},
         isDragging: false,
@@ -123,11 +123,13 @@
         // A splat is visible if angle(u_cam, u_point) <= theta_h + margin.
         float camDist = length(u_camPos);
         float ptDist = length(center);
-        if (camDist > ptDist && ptDist > 1.0) {
-            float cosHoriz = ptDist / camDist;
-            float horizonAngle = acos(clamp(cosHoriz, 0.0, 1.0));
-            float minCos = cos(min(3.14159, horizonAngle + 0.08));
-            if (dot(u_camPos / camDist, center / ptDist) < minCos) {
+        if (camDist > 0.1 && ptDist > 0.1) {
+            vec3 camNorm = u_camPos / camDist;
+            vec3 ptNorm = center / ptDist;
+            float cosHoriz = min(1.0, max(0.0, min(camDist, ptDist) / max(camDist, ptDist)));
+            float horizonAngle = acos(cosHoriz);
+            float minCos = cos(min(3.14159, horizonAngle + 0.15));
+            if (dot(camNorm, ptNorm) < minCos) {
                 gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
                 return;
             }
@@ -670,11 +672,78 @@
             }
         }
 
+        // Draw Focus Zone Boundary Ring & Crosshair if active or configured
+        let focusLat = document.getElementById('gen-focus-lat') ? parseFloat(document.getElementById('gen-focus-lat').value) : 0;
+        let focusLon = document.getElementById('gen-focus-lon') ? parseFloat(document.getElementById('gen-focus-lon').value) : 0;
+        let focusAreaVal = document.getElementById('gen-focus-area') ? parseFloat(document.getElementById('gen-focus-area').value) : 10;
+        let focusEnabled = document.getElementById('check-focus-enable') ? document.getElementById('check-focus-enable').checked : false;
+
+        if (state.focusArea) {
+            if (state.focusArea.enabled !== undefined) focusEnabled = state.focusArea.enabled;
+            if (state.focusArea.centerLat !== undefined) focusLat = state.focusArea.centerLat;
+            if (state.focusArea.centerLon !== undefined) focusLon = state.focusArea.centerLon;
+            if (state.focusArea.areaSqMiles !== undefined) focusAreaVal = state.focusArea.areaSqMiles;
+        }
+
+        if (focusEnabled) {
+            const sqKm = focusAreaVal * 2.589988;
+            const radiusKm = Math.sqrt(sqKm / Math.PI);
+
+            const fLatRad = focusLat * Math.PI / 180;
+            const fLonRad = focusLon * Math.PI / 180;
+
+            const sinFLat = Math.sin(fLatRad);
+            const cosFLat = Math.cos(fLatRad);
+            const sinFLon = Math.sin(fLonRad);
+            const cosFLon = Math.cos(fLonRad);
+
+            const e2 = (a * a - b * b) / (a * a);
+            const N = a / Math.sqrt(1.0 - e2 * sinFLat * sinFLat);
+            const cX = N * cosFLat * cosFLon;
+            const cY = N * cosFLat * sinFLon;
+            const cZ = N * (1.0 - e2) * sinFLat;
+
+            // Local tangent vectors
+            const eastX = -sinFLon;
+            const eastY = cosFLon;
+            const eastZ = 0;
+
+            const northX = -sinFLat * cosFLon;
+            const northY = -sinFLat * sinFLon;
+            const northZ = cosFLat;
+
+            const ringSegments = 64;
+            for (let i = 0; i <= ringSegments; i++) {
+                const angle = (i / ringSegments) * 2 * Math.PI;
+                const rCos = Math.cos(angle) * radiusKm;
+                const rSin = Math.sin(angle) * radiusKm;
+
+                const rx = cX + eastX * rCos + northX * rSin;
+                const ry = cY + eastY * rCos + northY * rSin;
+                const rz = cZ + eastZ * rCos + northZ * rSin;
+
+                lines.push(rx, ry, rz);
+                if (i > 0 && i < ringSegments) {
+                    lines.push(rx, ry, rz);
+                }
+            }
+
+            // Crosshair in center of focus area
+            const arm = radiusKm * 0.4;
+            lines.push(cX - eastX * arm, cY - eastY * arm, cZ - eastZ * arm);
+            lines.push(cX + eastX * arm, cY + eastY * arm, cZ + eastZ * arm);
+
+            lines.push(cX - northX * arm, cY - northY * arm, cZ - northZ * arm);
+            lines.push(cX + northX * arm, cY + northY * arm, cZ + northZ * arm);
+        }
+
         gridLineCount = lines.length / 3;
 
-        gridVAO = gl.createVertexArray();
+        if (!gridVAO) {
+            gridVAO = gl.createVertexArray();
+            gridVBO = gl.createBuffer();
+        }
         gl.bindVertexArray(gridVAO);
-        gridVBO = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, gridVBO);
         gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(lines), gl.STATIC_DRAW);
         gl.enableVertexAttribArray(0);
@@ -689,18 +758,95 @@
         state.camera.orbitDistance = dist;
         state.camera.orbitTheta = 0;
         state.camera.orbitPhi = 0.45;
+        state.camera.target = [0, 0, 0];
 
-        if (state.cameraMode === 'fly') {
-            state.camera.pos = [0, -dist * 0.85, dist * 0.5];
-            const lookDir = [-state.camera.pos[0], -state.camera.pos[1], -state.camera.pos[2]];
-            state.camera.quat = Quat.fromLookRotation(lookDir, [0, 0, 1]);
-        }
+        state.camera.pos = [0, -dist * 0.85, dist * 0.5];
+        const lookDir = [-state.camera.pos[0], -state.camera.pos[1], -state.camera.pos[2]];
+        state.camera.quat = Quat.fromLookRotation(lookDir, [0, 0, 1]);
 
         state.flightSpeed = 50.0;
         const sliderSpeed = document.getElementById('slider-speed');
         if (sliderSpeed) {
             sliderSpeed.value = state.flightSpeed;
             document.getElementById('val-speed').innerText = state.flightSpeed.toFixed(0) + ' km/s';
+        }
+    }
+
+    function frameFocusZone(customLat, customLon, customArea) {
+        let lat = customLat !== undefined ? customLat : (document.getElementById('gen-focus-lat') ? parseFloat(document.getElementById('gen-focus-lat').value) : 0.0);
+        let lon = customLon !== undefined ? customLon : (document.getElementById('gen-focus-lon') ? parseFloat(document.getElementById('gen-focus-lon').value) : 0.0);
+        let sqMiles = customArea !== undefined ? customArea : (document.getElementById('gen-focus-area') ? parseFloat(document.getElementById('gen-focus-area').value) : 10.0);
+
+        if (isNaN(lat)) lat = 0.0;
+        if (isNaN(lon)) lon = 0.0;
+        if (isNaN(sqMiles) || sqMiles <= 0) sqMiles = 10.0;
+
+        if (state.focusArea && state.focusArea.enabled) {
+            if (state.focusArea.centerLat !== undefined) lat = state.focusArea.centerLat;
+            if (state.focusArea.centerLon !== undefined) lon = state.focusArea.centerLon;
+            if (state.focusArea.areaSqMiles !== undefined) sqMiles = state.focusArea.areaSqMiles;
+        }
+
+        const a = state.spheroid.radius || 100.0;
+        const f = state.spheroid.flattening || 0.05;
+        const b = a * (1.0 - f);
+        const e2 = (a * a - b * b) / (a * a);
+
+        const latRad = lat * Math.PI / 180.0;
+        const lonRad = lon * Math.PI / 180.0;
+
+        const sinLat = Math.sin(latRad);
+        const cosLat = Math.cos(latRad);
+        const sinLon = Math.sin(lonRad);
+        const cosLon = Math.cos(lonRad);
+
+        const N = a / Math.sqrt(1.0 - e2 * sinLat * sinLat);
+        const surfX = N * cosLat * cosLon;
+        const surfY = N * cosLat * sinLon;
+        const surfZ = N * (1.0 - e2) * sinLat;
+
+        // Outward unit normal
+        const nx = cosLat * cosLon;
+        const ny = cosLat * sinLon;
+        const nz = sinLat;
+
+        const areaSqKm = sqMiles * 2.589988;
+        const radiusKm = Math.sqrt(areaSqKm / Math.PI);
+
+        // Position camera directly above focus area with optimal ground/aerial vantage
+        const altitude = Math.max(0.8, Math.min(a * 0.2, radiusKm * 1.6));
+
+        const camX = surfX + nx * altitude;
+        const camY = surfY + ny * altitude;
+        const camZ = surfZ + nz * altitude;
+
+        // In Orbit mode
+        state.camera.orbitTheta = lonRad;
+        state.camera.orbitPhi = latRad;
+        state.camera.orbitDistance = Math.hypot(camX, camY, camZ);
+        state.camera.target = [surfX, surfY, surfZ];
+
+        // In Fly mode
+        state.camera.pos = [camX, camY, camZ];
+        const lookDir = [surfX - camX, surfY - camY, surfZ - camZ];
+        state.camera.quat = Quat.fromLookRotation(lookDir, [0, 0, 1]);
+
+        state.flightSpeed = Math.max(1.0, altitude * 0.3);
+        const sliderSpeed = document.getElementById('slider-speed');
+        if (sliderSpeed) {
+            sliderSpeed.value = state.flightSpeed;
+            document.getElementById('val-speed').innerText = state.flightSpeed.toFixed(0) + ' km/s';
+        }
+
+        // Trigger immediate chunk streaming for this view
+        const canvas = document.getElementById('gl-canvas');
+        if (canvas) {
+            const aspect = canvas.width / canvas.height;
+            const near = 0.01;
+            const far = (state.spheroid.radius || 100) * 20.0;
+            const proj = Mat4.perspective(state.camera.fov, aspect, near, far);
+            const view = Mat4.lookAt(state.camera.pos, state.camera.target, [0, 0, 1]);
+            updateChunkCullingAndLOD(view, proj, aspect, near, far);
         }
     }
 
@@ -733,23 +879,44 @@
             if (meta.spheroid && meta.spheroid.radius > 0) {
                 state.spheroid = meta.spheroid;
                 initSpheroidGrid();
-                document.getElementById('gen-radius').value = state.spheroid.radius;
-                document.getElementById('gen-flattening').value = state.spheroid.flattening;
 
-                const currentDist = Math.hypot(state.camera.pos[0], state.camera.pos[1], state.camera.pos[2]);
-                if (currentDist < state.spheroid.radius * 1.05 || Math.abs(state.spheroid.radius - prevRadius) > 10) {
-                    framePlanet();
-                }
+                const infoRadius = document.getElementById('info-radius');
+                if (infoRadius) infoRadius.innerText = `${state.spheroid.radius.toFixed(1)} km`;
+                const infoFlat = document.getElementById('info-flattening');
+                if (infoFlat) infoFlat.innerText = `${state.spheroid.flattening.toFixed(4)} (${(state.spheroid.flattening * 100).toFixed(1)}%)`;
+
+                // Frame planet on initial load
+                framePlanet();
             }
 
             if (meta.density && meta.density.meanSpacingMeters) {
                 const sp = meta.density.meanSpacingMeters;
                 state.meanSpacingKm = sp / 1000.0;
-                document.getElementById('metric-spacing').innerText = sp >= 1000 ? (sp / 1000).toFixed(2) + ' km' : sp.toFixed(1) + ' m';
+                let spacingText = sp >= 1000 ? (sp / 1000).toFixed(2) + ' km' : sp.toFixed(1) + ' m';
+                if (meta.density.focusEnabled && meta.density.focusMeanSpacingMeters) {
+                    const fsp = meta.density.focusMeanSpacingMeters;
+                    const fspText = fsp >= 1000 ? (fsp / 1000).toFixed(2) + ' km' : fsp.toFixed(1) + ' m';
+                    spacingText += ` (🎯 ${fspText})`;
+                }
+                const metricSpacing = document.getElementById('metric-spacing');
+                if (metricSpacing) metricSpacing.innerText = spacingText;
+                const infoSpacing = document.getElementById('info-spacing');
+                if (infoSpacing) infoSpacing.innerText = `~${spacingText}`;
             } else {
                 const totalPts = meta.splatCount || 100000;
                 const surfArea = 4.0 * Math.PI * (state.spheroid.radius || 100.0) * (state.spheroid.radius || 100.0);
                 state.meanSpacingKm = Math.sqrt(surfArea / totalPts);
+            }
+
+            const infoFocus = document.getElementById('info-focus-status');
+            if (infoFocus) {
+                if (meta.focusArea && meta.focusArea.enabled) {
+                    infoFocus.innerText = `Active (${meta.focusArea.areaSqMiles.toFixed(0)} sq mi, ${meta.focusArea.densityMultiplier.toFixed(0)}x)`;
+                    infoFocus.style.color = 'var(--accent-gold)';
+                } else {
+                    infoFocus.innerText = 'Global Uniform';
+                    infoFocus.style.color = '#a1a1aa';
+                }
             }
 
             // Fetch Chunk Manifests
@@ -773,9 +940,9 @@
             // Trigger immediate initial visible chunk stream (only loads visible chunks at appropriate LOD)
             const aspect = canvas.width / canvas.height;
             const near = 0.01;
-            const far = (state.spheroid.radius || 100) * 20.0;
+            const far = (state.spheroid.radius || 100) * 5.0;
             const proj = Mat4.perspective(state.camera.fov, aspect, near, far);
-            const view = Mat4.lookAt(state.camera.pos, state.camera.target, [0, 0, 1]);
+            const view = state.cameraMode === 'fly' ? Quat.toViewMatrix(state.camera.pos, state.camera.quat) : Mat4.lookAt(state.camera.pos, state.camera.target, [0, 0, 1]);
             await updateChunkCullingAndLOD(view, proj, aspect, near, far);
 
             hideLoader();
@@ -964,22 +1131,23 @@
 
         try {
             const camPos = state.camera.pos;
-            const R = state.spheroid.radius || 100.0;
+            const a = state.spheroid.radius || 100.0;
+            const f = state.spheroid.flattening || 0.05;
             const bias = state.lodBias || 1.0;
-            const camDist = Math.hypot(camPos[0], camPos[1], camPos[2]);
-            const alt = state.altitude !== undefined ? state.altitude : Math.max(0.0001, camDist - R);
+            const camDist = Math.hypot(camPos[0], camPos[1], camPos[2]) || 1.0;
+            const localR = getLocalSurfaceRadius(camPos, a, f);
+            const alt = Math.max(0.0001, camDist - localR);
             const tanHalfFov = Math.tan(state.camera.fov / 2.0);
 
             // 1. Geometric Line-of-Sight Horizon Range
-            // The maximum Euclidean distance from camera to any point on the visible spherical cap:
-            // d_horizon = sqrt(2 * R * (alt + elevMax) + (alt + elevMax)^2) + sqrt(2 * R * elevMax)
-            const elevMax = (state.spheroid.radius || 100.0) * 0.15; // Mountain peaks elevation safety margin
-            const effAlt = alt + elevMax;
-            const dHorizon = Math.sqrt(Math.max(0.0, 2.0 * R * effAlt + effAlt * effAlt)) + Math.sqrt(Math.max(0.0, 2.0 * R * elevMax));
-            const maxVisibleDist = dHorizon + Math.max(15.0, R * 0.08);
+            // Maximum visible Euclidean distance over the horizon curvature
+            const elevMax = localR * 0.05; // 5% elevation safety margin
+            const dHorizonCam = Math.sqrt(Math.max(0.0, 2.0 * localR * alt + alt * alt));
+            const dHorizonElev = Math.sqrt(Math.max(0.0, 2.0 * localR * elevMax + elevMax * elevMax));
+            const maxVisibleDist = dHorizonCam + dHorizonElev + 10.0;
 
             // Planetary horizon angle from planet center
-            const cosHoriz = Math.min(1.0, Math.max(0.0, R / camDist));
+            const cosHoriz = Math.min(1.0, Math.max(0.0, localR / (localR + alt)));
             const horizonAngle = Math.acos(cosHoriz);
 
             let visibleChunks = 0;
@@ -990,43 +1158,52 @@
                 const cX = ch.center[0], cY = ch.center[1], cZ = ch.center[2];
                 const radius = ch.radius;
 
-                // 2. Strict Horizon Line-of-Sight Distance Culling
-                // If a chunk is physically behind the horizon curvature, cull it immediately
                 const distToCam = Math.hypot(cX - camPos[0], cY - camPos[1], cZ - camPos[2]);
-                if (distToCam - radius > maxVisibleDist) {
-                    ch.isVisible = false;
-                    continue;
-                }
 
-                // 3. Angular Planetary Horizon Occlusion Culling
-                const chunkDist = Math.hypot(cX, cY, cZ) || 1.0;
-                const dotCamChunk = (camPos[0]*cX + camPos[1]*cY + camPos[2]*cZ) / (camDist * chunkDist);
-                const chunkAngularRadius = radius / R;
-                const minCos = Math.cos(Math.min(Math.PI, horizonAngle + chunkAngularRadius + 0.04));
+                // Camera inside chunk sphere: guaranteed visible, never cull!
+                let isInside = (distToCam <= radius);
 
-                if (camDist > R && dotCamChunk < minCos) {
-                    ch.isVisible = false;
-                    continue;
-                }
+                if (!isInside) {
+                    // 2. Strict Horizon Line-of-Sight Distance Culling
+                    if (distToCam - radius > maxVisibleDist) {
+                        ch.isVisible = false;
+                        continue;
+                    }
 
-                // 4. View-Space Frustum Culling
-                const vX = view[0]*cX + view[4]*cY + view[8]*cZ + view[12];
-                const vY = view[1]*cX + view[5]*cY + view[9]*cZ + view[13];
-                const vZ = view[2]*cX + view[6]*cY + view[10]*cZ + view[14];
+                    // 3. Angular Planetary Horizon Occlusion Culling
+                    const chunkDist = Math.hypot(cX, cY, cZ) || 1.0;
+                    const dotCamChunk = (camPos[0]*cX + camPos[1]*cY + camPos[2]*cZ) / (camDist * chunkDist);
+                    const chunkAngularRadius = radius / localR;
+                    const elevAngle = Math.acos(Math.min(1.0, Math.max(0.0, localR / (localR + elevMax))));
+                    const maxAngle = Math.min(Math.PI, horizonAngle + elevAngle + chunkAngularRadius + 0.08);
+                    const minCos = Math.cos(maxAngle);
 
-                const viewDepth = -vZ;
-                const effectiveFar = Math.min(far, maxVisibleDist + radius);
-                if (viewDepth < near - radius || viewDepth > effectiveFar + radius) {
-                    ch.isVisible = false;
-                    continue;
-                }
+                    if (dotCamChunk < minCos) {
+                        ch.isVisible = false;
+                        continue;
+                    }
 
-                const halfH = viewDepth * tanHalfFov + radius * Math.sqrt(1.0 + tanHalfFov * tanHalfFov);
-                const halfW = viewDepth * (tanHalfFov * aspect) + radius * Math.sqrt(1.0 + (tanHalfFov * aspect) * (tanHalfFov * aspect));
+                    // 4. View-Space Frustum Culling
+                    const vX = view[0]*cX + view[4]*cY + view[8]*cZ + view[12];
+                    const vY = view[1]*cX + view[5]*cY + view[9]*cZ + view[13];
+                    const vZ = view[2]*cX + view[6]*cY + view[10]*cZ + view[14];
 
-                if (Math.abs(vY) > halfH || Math.abs(vX) > halfW) {
-                    ch.isVisible = false;
-                    continue;
+                    const viewDepth = -vZ;
+                    const effectiveFar = Math.min(far, maxVisibleDist + radius);
+                    if (viewDepth < near - radius || viewDepth > effectiveFar + radius) {
+                        ch.isVisible = false;
+                        continue;
+                    }
+
+                    if (viewDepth > 0) {
+                        const halfH = viewDepth * tanHalfFov + radius * Math.sqrt(1.0 + tanHalfFov * tanHalfFov);
+                        const halfW = viewDepth * (tanHalfFov * aspect) + radius * Math.sqrt(1.0 + (tanHalfFov * aspect) * (tanHalfFov * aspect));
+
+                        if (Math.abs(vY) > halfH || Math.abs(vX) > halfW) {
+                            ch.isVisible = false;
+                            continue;
+                        }
+                    }
                 }
 
                 ch.isVisible = true;
@@ -1232,11 +1409,11 @@
                 cam.quat = Quat.normalize(Quat.multiply(qRoll, cam.quat));
             }
 
-            // Smooth logarithmic speed: fast in high orbit, ultra-smooth and precise at 1km/low altitude
+            // Smooth logarithmic speed: fast in high orbit, ultra-smooth and precise at low altitude / ground level
             const speedBoost = (state.keys['ShiftLeft'] || state.keys['ShiftRight']) ? 5.0 : 1.0;
             const slowMode = (state.keys['AltLeft'] || state.keys['ControlLeft']) ? 0.15 : 1.0;
 
-            const adaptiveFactor = Math.max(0.005, (alt / 15.0) * 0.4 + 0.015);
+            const adaptiveFactor = Math.max(0.001, (alt / 15.0) * 0.4 + 0.003);
             const speed = (state.flightSpeed * adaptiveFactor * speedBoost * slowMode) * dt;
 
             let moveFwd = 0;
@@ -1254,8 +1431,8 @@
             cam.pos[1] += forward[1] * moveFwd * speed + right[1] * moveRight * speed + up[1] * moveUp * speed;
             cam.pos[2] += forward[2] * moveFwd * speed + right[2] * moveRight * speed + up[2] * moveUp * speed;
 
-            // Surface collision floor: enforces 0.5 km minimum altitude above surface
-            const minFlightAlt = 0.5;
+            // Surface collision floor: allows flying down to 5 meters above surface
+            const minFlightAlt = 0.005;
             const minAllowedDist = localR + minFlightAlt;
             const newDist = Math.hypot(cam.pos[0], cam.pos[1], cam.pos[2]);
             if (newDist < minAllowedDist) {
@@ -1307,6 +1484,9 @@
             alt = p / Math.cos(latRad) - N;
         }
 
+        state.currentLat = latDeg;
+        state.currentLon = lonDeg;
+
         document.getElementById('tele-lat').innerText = latDeg.toFixed(2) + '°';
         document.getElementById('tele-lon').innerText = lonDeg.toFixed(2) + '°';
 
@@ -1348,13 +1528,15 @@
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         const aspect = canvas.width / canvas.height;
-        const R = state.spheroid.radius || 100.0;
+        const a = state.spheroid.radius || 100.0;
+        const f = state.spheroid.flattening || 0.05;
         const camDist = Math.hypot(state.camera.pos[0], state.camera.pos[1], state.camera.pos[2]);
-        const alt = Math.max(0.0001, camDist - R);
+        const localR = getLocalSurfaceRadius(state.camera.pos, a, f);
+        const alt = Math.max(0.0001, camDist - localR);
 
-        // Near plane scales from centimeters up to kilometers without clipping close terrain
-        const near = Math.max(0.00001, Math.min(0.2, alt * 0.002));
-        const far = Math.max(100000.0, (R + camDist) * 10.0);
+        // Near plane scales dynamically with altitude for high depth buffer precision without near-plane clipping
+        const near = Math.max(0.001, Math.min(1.0, alt * 0.05));
+        const far = Math.max(300.0, (a + camDist) * 3.0);
 
         const proj = Mat4.perspective(state.camera.fov, aspect, near, far);
         let view;
@@ -1539,6 +1721,13 @@
             });
         }
 
+        const btnFrameFocus = document.getElementById('btn-frame-focus');
+        if (btnFrameFocus) {
+            btnFrameFocus.addEventListener('click', () => {
+                frameFocusZone();
+            });
+        }
+
         const sliderScale = document.getElementById('slider-scale');
         if (sliderScale) {
             sliderScale.addEventListener('input', (e) => {
@@ -1620,115 +1809,84 @@
             });
         }
 
-        const selectPreset = document.getElementById('select-terrain-preset');
-        if (selectPreset) {
-            selectPreset.addEventListener('change', (e) => {
-                const preset = e.target.value;
-                const R = parseFloat(document.getElementById('gen-radius').value) || 100.0;
-                if (preset === 'earth') {
-                    document.getElementById('gen-elev').value = (R * 0.08).toFixed(1);
-                    document.getElementById('gen-elev-offset').value = '0.00';
-                    document.getElementById('gen-freq').value = '1.5';
-                } else if (preset === 'highlands') {
-                    document.getElementById('gen-elev').value = (R * 0.18).toFixed(1);
-                    document.getElementById('gen-elev-offset').value = '0.15';
-                    document.getElementById('gen-freq').value = '2.2';
-                } else if (preset === 'archipelago') {
-                    document.getElementById('gen-elev').value = (R * 0.06).toFixed(1);
-                    document.getElementById('gen-elev-offset').value = '-0.25';
-                    document.getElementById('gen-freq').value = '3.5';
-                } else if (preset === 'pangaea') {
-                    document.getElementById('gen-elev').value = (R * 0.12).toFixed(1);
-                    document.getElementById('gen-elev-offset').value = '0.10';
-                    document.getElementById('gen-freq').value = '0.8';
-                } else if (preset === 'smooth') {
-                    document.getElementById('gen-elev').value = (R * 0.01).toFixed(1);
-                    document.getElementById('gen-elev-offset').value = '0.00';
-                    document.getElementById('gen-freq').value = '1.0';
-                }
+        const checkGrid = document.getElementById('check-spheroid-grid');
+        if (checkGrid) {
+            checkGrid.addEventListener('change', (e) => {
+                state.showGrid = e.target.checked;
             });
         }
 
-        document.getElementById('check-spheroid-grid').addEventListener('change', (e) => {
-            state.showGrid = e.target.checked;
-        });
+        function flyToGeodetic(latDeg, lonDeg, altKm = 15.0) {
+            const a = state.spheroid.radius || 100.0;
+            const f = state.spheroid.flattening || 0.05;
+            const b = a * (1.0 - f);
+            const e2 = (a * a - b * b) / (a * a);
+            const latRad = latDeg * Math.PI / 180.0;
+            const lonRad = lonDeg * Math.PI / 180.0;
+            const sinLat = Math.sin(latRad);
+            const cosLat = Math.cos(latRad);
+            const N = a / Math.sqrt(1.0 - e2 * sinLat * sinLat);
 
-        const genOverlap = document.getElementById('gen-overlap');
-        genOverlap.addEventListener('input', (e) => {
-            document.getElementById('val-gen-overlap').innerText = parseFloat(e.target.value).toFixed(2);
-        });
+            const surfX = N * cosLat * Math.cos(lonRad);
+            const surfY = N * cosLat * Math.sin(lonRad);
+            const surfZ = (N * (1.0 - e2)) * sinLat;
 
-        const sliderCurvTol = document.getElementById('slider-curv-tol');
-        if (sliderCurvTol) {
-            sliderCurvTol.addEventListener('input', (e) => {
-                document.getElementById('val-curv-tol').innerText = parseFloat(e.target.value).toFixed(2) + ' km';
-            });
-        }
+            const nx = cosLat * Math.cos(lonRad);
+            const ny = cosLat * Math.sin(lonRad);
+            const nz = sinLat;
 
-        const btnRegenerate = document.getElementById('btn-regenerate');
-        btnRegenerate.addEventListener('click', async () => {
-            btnRegenerate.disabled = true;
-            showLoader('Generating Chunked Multi-LOD Gaussian Splats...');
+            const camX = surfX + nx * altKm;
+            const camY = surfY + ny * altKm;
+            const camZ = surfZ + nz * altKm;
 
-            const gridStr = document.getElementById('gen-chunk-grid') ? document.getElementById('gen-chunk-grid').value : 'auto';
-            let geometryType = 'cubed-sphere';
-            let patchesPerFace = 0; // 0 triggers auto-adaptive density chunking
-            let chunkRows = 8;
-            let chunkCols = 16;
+            state.camera.target = [surfX, surfY, surfZ];
+            state.camera.pos = [camX, camY, camZ];
 
-            if (gridStr === 'auto') {
-                geometryType = 'cubed-sphere';
-                patchesPerFace = 0;
-            } else if (gridStr.startsWith('cubed-')) {
-                geometryType = 'cubed-sphere';
-                patchesPerFace = parseInt(gridStr.replace('cubed-', ''), 10) || 4;
-            } else {
-                geometryType = 'latlon';
-                const parts = gridStr.split('x');
-                chunkRows = parseInt(parts[0], 10) || 8;
-                chunkCols = parseInt(parts[1], 10) || 16;
+            // In Orbit mode
+            state.camera.orbitTheta = lonRad;
+            state.camera.orbitPhi = latRad;
+            state.camera.orbitDistance = Math.hypot(camX, camY, camZ);
+
+            // In Fly mode - orient directly looking down at surface
+            const lookDir = [surfX - camX, surfY - camY, surfZ - camZ];
+            state.camera.quat = Quat.fromLookRotation(lookDir, [0, 0, 1]);
+
+            state.flightSpeed = Math.max(1.0, altKm * 0.3);
+            const sliderSpeed = document.getElementById('slider-speed');
+            if (sliderSpeed) {
+                sliderSpeed.value = state.flightSpeed;
+                document.getElementById('val-speed').innerText = state.flightSpeed.toFixed(0) + ' km/s';
             }
 
-            const payload = {
-                geometryType: geometryType,
-                patchesPerFace: patchesPerFace,
-                radius: parseFloat(document.getElementById('gen-radius').value),
-                flattening: parseFloat(document.getElementById('gen-flattening').value),
-                latMin: -90.0,
-                latMax: 90.0,
-                lonMin: -180.0,
-                lonMax: 180.0,
-                stepsLat: parseInt(document.getElementById('gen-res-lat').value, 10),
-                stepsLon: parseInt(document.getElementById('gen-res-lon').value, 10),
-                elevationScale: parseFloat(document.getElementById('gen-elev').value),
-                elevationOffset: parseFloat(document.getElementById('gen-elev-offset').value),
-                noiseSeed: parseInt(document.getElementById('gen-seed').value, 10),
-                noiseFrequency: parseFloat(document.getElementById('gen-freq').value),
-                octaves: 5,
-                overlapFactor: parseFloat(document.getElementById('gen-overlap').value),
-                thicknessFactor: 0.15,
-                seaLevel: 0.30,
-                adaptiveDensity: document.getElementById('check-adaptive-density') ? document.getElementById('check-adaptive-density').checked : true,
-                curvatureTolerance: document.getElementById('slider-curv-tol') ? parseFloat(document.getElementById('slider-curv-tol').value) : 0.12,
-                chunkRows: chunkRows,
-                chunkCols: chunkCols
-            };
+            // Immediately evaluate culling for new location
+            const canvas = document.getElementById('gl-canvas');
+            if (canvas) {
+                const aspect = canvas.width / canvas.height;
+                const near = Math.max(0.001, altKm * 0.05);
+                const far = Math.max(300.0, (a + Math.hypot(camX, camY, camZ)) * 3.0);
+                const proj = Mat4.perspective(state.camera.fov, aspect, near, far);
+                const view = Quat.toViewMatrix(state.camera.pos, state.camera.quat);
+                updateChunkCullingAndLOD(view, proj, aspect, near, far);
+            }
+        }
 
-            try {
-                const res = await fetch('/api/generate', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify(payload)
+        // Geographic location navigation shortcuts
+        const locs = [
+            { id: 'btn-loc-seattle', lat: 47.581, lon: -122.335, alt: 12.0 },
+            { id: 'btn-loc-everest', lat: 27.988, lon: 86.925, alt: 18.0 },
+            { id: 'btn-loc-trench', lat: 11.35, lon: 142.2, alt: 22.0 },
+            { id: 'btn-loc-canyon', lat: 36.1, lon: -112.1, alt: 16.0 },
+            { id: 'btn-loc-alps', lat: 45.83, lon: 6.86, alt: 16.0 },
+            { id: 'btn-loc-hawaii', lat: 19.82, lon: -155.47, alt: 20.0 },
+            { id: 'btn-loc-amazon', lat: -3.0, lon: -60.0, alt: 25.0 }
+        ];
+
+        locs.forEach(loc => {
+            const btn = document.getElementById(loc.id);
+            if (btn) {
+                btn.addEventListener('click', () => {
+                    flyToGeodetic(loc.lat, loc.lon, loc.alt);
                 });
-                const data = await res.json();
-                if (data.success) {
-                    await fetchSplatData();
-                }
-            } catch (err) {
-                alert('Regeneration failed: ' + err.message);
-            } finally {
-                btnRegenerate.disabled = false;
-                hideLoader();
             }
         });
     }

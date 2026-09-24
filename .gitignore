@@ -12,6 +12,7 @@ bin/
 dist/
 
 # 3D Gaussian Splat & Point Cloud Large Datasets
+splats/
 *.splat
 *.ply
 *.las
@@ -19,7 +20,9 @@ dist/
 *.pcd
 *.bin
 
-# GIS & Elevation Rasters
+# GIS & Elevation Rasters & Source Images
+images/
+World_elevation_map.png
 *.tif
 *.tiff
 *.geotiff

@@ -251,3 +251,35 @@ func matrixToQuaternion(m00, m01, m02, m10, m11, m12, m20, m21, m22 float64) Qua
 
 	return q
 }
+
+// SqMilesToSqKm is the multiplier to convert square miles to square kilometers.
+const SqMilesToSqKm = 2.589988110336
+
+// SqKmToSqMiles is the multiplier to convert square kilometers to square miles.
+const SqKmToSqMiles = 0.38610215854245
+
+// SurfaceDistance calculates the geodesic surface distance in model units (km)
+// between two geodetic coordinate points (lat1, lon1) and (lat2, lon2) on the spheroid.
+func (s Spheroid) SurfaceDistance(lat1, lon1, lat2, lon2 float64) float64 {
+	p1 := s.GeodeticToECEF(lat1, lon1, 0)
+	p2 := s.GeodeticToECEF(lat2, lon2, 0)
+
+	dx := p1.X - p2.X
+	dy := p1.Y - p2.Y
+	dz := p1.Z - p2.Z
+	chord := math.Sqrt(dx*dx + dy*dy + dz*dz)
+
+	meanR := (s.SemiMajorAxis*2.0 + s.SemiMinorAxis) / 3.0
+	if meanR <= 0 {
+		meanR = s.SemiMajorAxis
+	}
+	if meanR <= 0 {
+		return chord
+	}
+
+	ratio := chord / (2.0 * meanR)
+	if ratio > 1.0 {
+		ratio = 1.0
+	}
+	return 2.0 * meanR * math.Asin(ratio)
+}

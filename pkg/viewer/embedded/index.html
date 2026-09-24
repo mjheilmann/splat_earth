@@ -20,7 +20,7 @@
             <div class="brand-badge">3DGS</div>
             <div class="brand-title">
                 <h1>Spheroid Splat Terrain</h1>
-                <span class="subtitle">Geometry-less Oblate Ellipsoid GIS Spike</span>
+                <span class="subtitle">Global Elevation & Bathymetry Splat Engine</span>
             </div>
         </div>
         <div class="metrics-grid">
@@ -81,9 +81,9 @@
         </div>
 
         <div class="sidebar-content">
-            <!-- Camera Mode Section -->
+            <!-- Camera Navigation Section -->
             <div class="control-group">
-                <label class="group-title">Camera Mode</label>
+                <label class="group-title">Camera Navigation</label>
                 <div class="segmented-control">
                     <button class="seg-btn active" id="btn-mode-fly">Fly Cam</button>
                     <button class="seg-btn" id="btn-mode-orbit">Orbit</button>
@@ -94,9 +94,14 @@
                 <div class="nav-help hidden" id="orbit-help">
                     <small><b>Left Drag</b>: Rotate | <b>Right Drag</b>: Pan | <b>Scroll</b>: Zoom</small>
                 </div>
-                <button id="btn-frame-planet" class="action-btn secondary-btn" style="margin-top: 4px;">
-                    <span>🎯 Frame Whole Planet</span>
-                </button>
+                <div style="display: flex; gap: 6px; margin-top: 6px;">
+                    <button id="btn-frame-planet" class="action-btn secondary-btn" style="flex: 1;">
+                        <span>🪐 Frame Planet</span>
+                    </button>
+                    <button id="btn-frame-focus" class="action-btn primary-btn" style="flex: 1;">
+                        <span>🎯 Fly to Focus</span>
+                    </button>
+                </div>
             </div>
 
             <!-- Splat Visual Tuning -->
@@ -135,11 +140,19 @@
                     <input type="range" id="slider-speed" min="1" max="500" step="5" value="60">
                 </div>
 
+                <div class="slider-control">
+                    <div class="slider-header">
+                        <span>LOD Distance Bias</span>
+                        <span class="slider-val" id="val-lod-bias">1.0x</span>
+                    </div>
+                    <input type="range" id="slider-lod-bias" min="0.3" max="3.0" step="0.1" value="1.0">
+                </div>
+
                 <div class="select-control">
-                    <label for="select-shading">Color Mode</label>
+                    <label for="select-shading">Color & Shading Mode</label>
                     <select id="select-shading">
-                        <option value="0">Biome Colors</option>
-                        <option value="1">Elevation Colormap</option>
+                        <option value="0">Realistic Satellite Biomes</option>
+                        <option value="1">Elevation Hypsometric Colormap</option>
                         <option value="2">Surface Normals</option>
                         <option value="3">Gaussian Footprint Debug</option>
                     </select>
@@ -148,7 +161,7 @@
                 <div class="checkbox-control">
                     <label>
                         <input type="checkbox" id="check-spheroid-grid" checked>
-                        <span>Show Spheroid Equator / Grid</span>
+                        <span>Show Spheroid Equator / Coordinates</span>
                     </label>
                 </div>
                 <div class="checkbox-control">
@@ -195,114 +208,49 @@
                 </div>
             </div>
 
-            <!-- Live Generator Stand-In Section -->
+            <!-- Geographic Locations Navigation -->
             <div class="control-group">
-                <label class="group-title">GIS Stand-In Generator</label>
-                
-                <div class="input-row">
-                    <div class="input-col">
-                        <label>Radius (a, km)</label>
-                        <input type="number" id="gen-radius" value="100" min="1" max="100000">
+                <label class="group-title">Geographic Locations</label>
+                <div style="display: flex; flex-direction: column; gap: 6px;">
+                    <button type="button" class="action-btn primary-btn" id="btn-loc-seattle" style="font-size: 0.82rem; padding: 7px; background: linear-gradient(135deg, rgba(255, 184, 48, 0.25), rgba(0, 204, 255, 0.25)); border: 1px solid var(--accent-gold); color: #fff;">
+                        <span>🏙️ Seattle / Puget Sound (1m LiDAR Focus)</span>
+                    </button>
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-everest" style="flex: 1; font-size: 0.8rem; padding: 6px;">🏔️ Himalayas / Everest</button>
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-trench" style="flex: 1; font-size: 0.8rem; padding: 6px;">🌊 Mariana Trench</button>
                     </div>
-                    <div class="input-col">
-                        <label>Flattening (f)</label>
-                        <input type="number" id="gen-flattening" value="0.05" step="0.005" min="0" max="0.25">
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-canyon" style="flex: 1; font-size: 0.8rem; padding: 6px;">🏜️ Grand Canyon</button>
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-alps" style="flex: 1; font-size: 0.8rem; padding: 6px;">⛷️ European Alps</button>
                     </div>
-                </div>
-
-                <div class="input-row">
-                    <div class="input-col">
-                        <label>Lat Rings</label>
-                        <input type="number" id="gen-res-lat" value="150" min="20" max="200000" step="100">
-                    </div>
-                    <div class="input-col">
-                        <label>Equator Lon Base</label>
-                        <input type="number" id="gen-res-lon" value="300" min="20" max="200000" step="100">
+                    <div style="display: flex; gap: 6px;">
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-hawaii" style="flex: 1; font-size: 0.8rem; padding: 6px;">🏝️ Hawaii / Pacific</button>
+                        <button type="button" class="action-btn secondary-btn" id="btn-loc-amazon" style="flex: 1; font-size: 0.8rem; padding: 6px;">🌿 Amazon Basin</button>
                     </div>
                 </div>
+            </div>
 
-                <div class="select-control">
-                    <label for="select-terrain-preset">Terrain Preset</label>
-                    <select id="select-terrain-preset">
-                        <option value="earth">Earth-like (Continents & Oceans)</option>
-                        <option value="highlands">Mountainous Highlands</option>
-                        <option value="archipelago">Archipelago & Islands</option>
-                        <option value="pangaea">Pangaea Supercontinent</option>
-                        <option value="smooth">Smooth Ellipsoid (Low Relief)</option>
-                    </select>
-                </div>
-
-                <div class="input-row">
-                    <div class="input-col">
-                        <label>Elev Scale (km)</label>
-                        <input type="number" id="gen-elev" value="12.0" step="0.5" min="0" max="1000">
+            <!-- Planet Dataset & Spheroid Info -->
+            <div class="control-group">
+                <label class="group-title">Spheroid & Dataset</label>
+                <div style="background: rgba(0, 153, 255, 0.05); border: 1px solid rgba(0, 153, 255, 0.18); border-radius: 8px; padding: 10px; display: flex; flex-direction: column; gap: 6px; font-size: 0.8rem;">
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #a1a1aa;">Equatorial Radius (a):</span>
+                        <span id="info-radius" style="font-weight: 600; color: #fff;">100.0 km</span>
                     </div>
-                    <div class="input-col">
-                        <label>Elev Offset (shift)</label>
-                        <input type="number" id="gen-elev-offset" value="0.0" step="0.05" min="-0.6" max="0.6">
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #a1a1aa;">Flattening (f):</span>
+                        <span id="info-flattening" style="font-weight: 600; color: #fff;">0.05 (5%)</span>
                     </div>
-                </div>
-
-                <div class="input-row">
-                    <div class="input-col">
-                        <label>Noise Seed</label>
-                        <input type="number" id="gen-seed" value="42">
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #a1a1aa;">Global Spacing:</span>
+                        <span id="info-spacing" style="font-weight: 600; color: var(--accent-blue);">~1.76 km</span>
                     </div>
-                    <div class="input-col">
-                        <label>Noise Frequency</label>
-                        <input type="number" id="gen-freq" value="1.5" step="0.1" min="0.2" max="10">
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #a1a1aa;">Focus Zone:</span>
+                        <span id="info-focus-status" style="font-weight: 600; color: var(--accent-gold);">Enabled</span>
                     </div>
                 </div>
-
-                <div class="input-row">
-                    <div class="input-col">
-                        <label>Chunk Grid Geometry</label>
-                        <select id="gen-chunk-grid">
-                            <option value="auto" selected>⚡ Auto-Adaptive (Density Optimized)</option>
-                            <option value="cubed-4">6 Faces x 4x4 (96 Patches) - Cubed-Sphere</option>
-                            <option value="cubed-6">6 Faces x 6x6 (216 Patches) - Cubed-Sphere</option>
-                            <option value="cubed-8">6 Faces x 8x8 (384 Patches) - Cubed-Sphere</option>
-                            <option value="cubed-2">6 Faces x 2x2 (24 Patches) - Cubed-Sphere</option>
-                            <option value="8x16">8 x 16 (128 Chunks) - Lat/Lon</option>
-                            <option value="12x24">12 x 24 (288 Chunks) - Lat/Lon</option>
-                        </select>
-                    </div>
-                </div>
-
-                <div class="checkbox-control" style="margin-top: 6px;">
-                    <label>
-                        <input type="checkbox" id="check-adaptive-density">
-                        <span>⚡ Variable Density (Quadtree Adaptive)</span>
-                    </label>
-                </div>
-
-                <div class="slider-control" id="group-curv-tol">
-                    <div class="slider-header">
-                        <span>Curvature Tolerance (Δh)</span>
-                        <span class="slider-val" id="val-curv-tol">0.12 km</span>
-                    </div>
-                    <input type="range" id="slider-curv-tol" min="0.02" max="1.0" step="0.02" value="0.12">
-                </div>
-
-                <div class="slider-control">
-                    <div class="slider-header">
-                        <span>LOD Distance Bias</span>
-                        <span class="slider-val" id="val-lod-bias">1.0x</span>
-                    </div>
-                    <input type="range" id="slider-lod-bias" min="0.3" max="3.0" step="0.1" value="1.0">
-                </div>
-
-                <div class="slider-control">
-                    <div class="slider-header">
-                        <span>Overlap Factor</span>
-                        <span class="slider-val" id="val-gen-overlap">1.35</span>
-                    </div>
-                    <input type="range" id="gen-overlap" min="0.8" max="2.0" step="0.05" value="1.35">
-                </div>
-
-                <button id="btn-regenerate" class="action-btn primary-btn">
-                    <span>⚡ Regenerate Splats</span>
-                </button>
             </div>
         </div>
     </aside>

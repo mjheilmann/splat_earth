@@ -49,6 +49,9 @@ type DensityMetrics struct {
 	RecommendedPatchesPerFace int     `json:"recommendedPatchesPerFace"`
 	TotalChunks               int     `json:"totalChunks"`
 	SplatsPerChunkLOD0        int     `json:"splatsPerChunkLOD0"`
+	FocusEnabled              bool    `json:"focusEnabled"`
+	FocusSplatsPerKm2         float64 `json:"focusSplatsPerKm2,omitempty"`
+	FocusMeanSpacingMeters    float64 `json:"focusMeanSpacingMeters,omitempty"`
 }
 
 // EstimatePointDensity calculates the spatial density and recommends optimal chunk partitioning.
@@ -83,7 +86,7 @@ func (tg *TerrainGenerator) EstimatePointDensity(totalPoints int) DensityMetrics
 	totalChunksCount := 6 * patchesPerFace * patchesPerFace
 	splatsPerChunk := totalPoints / totalChunksCount
 
-	return DensityMetrics{
+	metrics := DensityMetrics{
 		TotalPoints:               totalPoints,
 		SurfaceAreaKm2:            surfaceArea,
 		SplatsPerKm2:              splatsPerKm2,
@@ -92,6 +95,20 @@ func (tg *TerrainGenerator) EstimatePointDensity(totalPoints int) DensityMetrics
 		TotalChunks:               totalChunksCount,
 		SplatsPerChunkLOD0:        splatsPerChunk,
 	}
+
+	activeZones := tg.config.ActiveFocusAreas()
+	if len(activeZones) > 0 {
+		metrics.FocusEnabled = true
+		primary := activeZones[0]
+		mult := primary.DensityMultiplier
+		if mult < 1.0 {
+			mult = 1.0
+		}
+		metrics.FocusSplatsPerKm2 = splatsPerKm2 * mult
+		metrics.FocusMeanSpacingMeters = meanSpacingMeters / math.Sqrt(mult)
+	}
+
+	return metrics
 }
 
 // lodTargetResolutions defines the target point count per patch axis for each LOD level.
@@ -327,6 +344,12 @@ func (tg *TerrainGenerator) NewProceduralCubedSphere(patchesPerFaceAxis int) *Pr
 				c2 := n2 * n2
 				c3 := n3 * n3
 				c4 := n4 * n4
+
+				chunkDensity := tg.GetDensityMultiplier(latRad*180/math.Pi, lonRad*180/math.Pi)
+				if chunkDensity > 1.05 {
+					c0 = int(float64(c0) * chunkDensity)
+				}
+
 				if c0 < 1 { c0 = 1 }
 				if c1 < 1 { c1 = 1 }
 				if c2 < 1 { c2 = 1 }
@@ -396,7 +419,7 @@ func (tg *TerrainGenerator) GenerateCubedSphereSplats(patchesPerFaceAxis int) []
 }
 
 // sampleCubedSpherePatch samples Gaussian splats over a spherified cube face patch.
-// When cfg.AdaptiveDensity is true, it uses quadtree curvature-adaptive sampling to collapse flat plains/oceans into larger splats.
+// Subdivides to baseDepth across the general planet, and to maxFocusDepth in steered high-density focus areas.
 func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	face CubeFace, fCenter, fUAxis, fVAxis spheroid.Vec3,
 	uMin, uMax, vMin, vMax float64,
@@ -410,25 +433,47 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	surfaceArea := 4.0 * math.Pi * cfg.Spheroid.SemiMajorAxis * cfg.Spheroid.SemiMajorAxis
 	patchArea := surfaceArea / float64(6*patchesPerFaceAxis*patchesPerFaceAxis)
 
-	if cfg.AdaptiveDensity {
-		ptsPerSide := float64(res) / float64(stride)
-		if ptsPerSide < 1.0 {
-			ptsPerSide = 1.0
-		}
-		maxDepth := int(math.Round(math.Log2(ptsPerSide)))
-		if maxDepth < 1 {
-			maxDepth = 1
-		}
-		if maxDepth > 8 {
-			maxDepth = 8 // Max 256x256 sub-cells per patch
+	ptsPerSide := float64(res) / float64(stride)
+	if ptsPerSide < 1.0 {
+		ptsPerSide = 1.0
+	}
+	baseDepth := int(math.Round(math.Log2(ptsPerSide)))
+	if baseDepth < 1 {
+		baseDepth = 1
+	}
+
+	activeZones := cfg.ActiveFocusAreas()
+	hasSteeredDensity := len(activeZones) > 0
+
+	if cfg.AdaptiveDensity || hasSteeredDensity {
+		maxFocusDepth := baseDepth
+		for _, z := range activeZones {
+			mult := z.DensityMultiplier
+			if mult < 2.0 {
+				mult = 2.0
+			}
+			boost := int(math.Ceil(0.5 * math.Log2(mult))) + 1
+			if boost < 2 {
+				boost = 2
+			}
+			depthForZone := baseDepth + boost
+			if depthForZone < 6 {
+				depthForZone = 6 // Ensure crisp microscopic detail in focus zone
+			}
+			if depthForZone > 11 {
+				depthForZone = 11
+			}
+			if depthForZone > maxFocusDepth {
+				maxFocusDepth = depthForZone
+			}
 		}
 
-		splats := make([]splat.Splat, 0, 128)
+		splats := make([]splat.Splat, 0, 256)
 		tg.sampleAdaptiveQuad(
 			face, fCenter, fUAxis, fVAxis,
 			uMin, uMax, vMin, vMax,
 			uMin, uMax, vMin, vMax,
-			0, maxDepth, patchArea,
+			0, baseDepth, maxFocusDepth, patchArea,
 			&splats,
 		)
 		return splats
@@ -440,10 +485,6 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	du := (uMax - uMin) / float64(res)
 	dv := (vMax - vMin) / float64(res)
 
-	ptsPerSide := float64(res) / float64(stride)
-	if ptsPerSide < 1.0 {
-		ptsPerSide = 1.0
-	}
 	splatSpacing := math.Sqrt(patchArea) / ptsPerSide
 
 	for i := 0; i < res; i += stride {
@@ -480,10 +521,16 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 			// Transform to Oblate Spheroid ECEF Cartesian position
 			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
 
-			// Gaussian Splat Scale: Tangent footprint matching grid spacing
-			sx := float32(0.5 * splatSpacing * cfg.OverlapFactor)
-			sy := float32(0.5 * splatSpacing * cfg.OverlapFactor)
-			sz := float32(0.5 * splatSpacing * cfg.ThicknessFactor)
+			// Gaussian Splat Scale: Tangent footprint matching local density spacing
+			localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
+			localSpacing := splatSpacing
+			if localDensity > 1.0 {
+				localSpacing = splatSpacing / math.Sqrt(localDensity)
+			}
+
+			sx := float32(0.5 * localSpacing * cfg.OverlapFactor)
+			sy := float32(0.5 * localSpacing * cfg.OverlapFactor)
+			sz := float32(0.5 * localSpacing * cfg.ThicknessFactor)
 
 			// Normal-aligned rotation quaternion
 			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
@@ -503,12 +550,13 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	return splats
 }
 
-// sampleAdaptiveQuad recursively subdivides a patch quadrant based on local terrain curvature / elevation deviation.
+// sampleAdaptiveQuad recursively subdivides a patch quadrant based on local terrain curvature / elevation deviation
+// and steered high-density focus areas.
 func (tg *TerrainGenerator) sampleAdaptiveQuad(
 	face CubeFace, fCenter, fUAxis, fVAxis spheroid.Vec3,
 	u0, u1, v0, v1 float64,
 	patchUMin, patchUMax, patchVMin, patchVMax float64,
-	depth, maxDepth int,
+	depth, baseDepth, maxFocusDepth int,
 	patchArea float64,
 	splats *[]splat.Splat,
 ) {
@@ -557,15 +605,75 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 		tol = 0.12 // 120m default tolerance
 	}
 
-	// Subdivide if error exceeds curvature tolerance and not at max depth
-	shouldSubdivide := depth < maxDepth && (errH > tol || (depth < 2 && elevMid > cfg.SeaLevel && spanH > tol*2.5))
+	// Metric cell size and bounding radius of this quad on the spheroid
+	cellFraction := (u1 - u0) / (patchUMax - patchUMin)
+	cellSpacing := math.Sqrt(patchArea) * cellFraction
+	quadRadiusKm := cellSpacing * 0.7071
+
+	targetDepth := baseDepth
+	activeZones := cfg.ActiveFocusAreas()
+
+	for _, z := range activeZones {
+		mult := z.DensityMultiplier
+		if mult < 2.0 {
+			mult = 2.0
+		}
+		boost := int(math.Ceil(0.5 * math.Log2(mult))) + 1
+		if boost < 2 {
+			boost = 2
+		}
+		zoneTargetDepth := baseDepth + boost
+		if zoneTargetDepth < 6 {
+			zoneTargetDepth = 6
+		}
+		if zoneTargetDepth > maxFocusDepth {
+			zoneTargetDepth = maxFocusDepth
+		}
+
+		radius := z.RadiusKm()
+		trans := z.TransitionWidthKm
+		if trans <= 0 {
+			trans = math.Max(0.5, radius*0.6)
+		}
+
+		dist := cfg.Spheroid.SurfaceDistance(latMid, lonMid, z.CenterLat, z.CenterLon)
+		minDist := math.Max(0.0, dist-quadRadiusKm)
+		maxDist := dist + quadRadiusKm
+
+		zoneDepth := baseDepth
+		if maxDist <= radius {
+			// Entire quad is completely inside focus core
+			zoneDepth = zoneTargetDepth
+		} else if minDist <= radius {
+			// Quad overlaps the focus core boundary
+			zoneDepth = zoneTargetDepth
+		} else if minDist < radius+trans {
+			// Quad is in smooth transition margin
+			t := (minDist - radius) / trans
+			w := 0.5 * (1.0 + math.Cos(math.Pi*t))
+			zoneDepth = baseDepth + int(math.Round(float64(zoneTargetDepth-baseDepth)*w))
+		}
+
+		if zoneDepth > targetDepth {
+			targetDepth = zoneDepth
+		}
+	}
+
+	shouldSubdivide := false
+	if depth < targetDepth {
+		shouldSubdivide = true
+	} else if cfg.AdaptiveDensity && depth < maxFocusDepth {
+		if errH > tol || (depth < 2 && elevMid > cfg.SeaLevel && spanH > tol*2.5) {
+			shouldSubdivide = true
+		}
+	}
 
 	if shouldSubdivide {
 		// Subdivide into 4 child quadrants
-		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
-		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
-		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
-		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, maxDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, baseDepth, maxFocusDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, v0, vMid, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, baseDepth, maxFocusDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, u0, uMid, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, baseDepth, maxFocusDepth, patchArea, splats)
+		tg.sampleAdaptiveQuad(face, fCenter, fUAxis, fVAxis, uMid, u1, vMid, v1, patchUMin, patchUMax, patchVMin, patchVMax, depth+1, baseDepth, maxFocusDepth, patchArea, splats)
 		return
 	}
 
@@ -573,10 +681,6 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 	elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latMid, lonMid)
 	height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
 	posECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, height)
-
-	// Metric cell spacing proportional to fraction of patch size
-	cellFraction := (u1 - u0) / (patchUMax - patchUMin)
-	cellSpacing := math.Sqrt(patchArea) * cellFraction
 
 	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor)
 	sy := float32(0.5 * cellSpacing * cfg.OverlapFactor)
