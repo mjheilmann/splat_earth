@@ -32,7 +32,9 @@ func main() {
 	elevOffset := flag.Float64("elev-offset", 0.0, "Baseline elevation offset (-0.5 to +0.5)")
 	overlap := flag.Float64("overlap", 1.35, "Splat size overlap factor for continuous coverage")
 	thickness := flag.Float64("thickness", 0.035, "Splat normal thickness factor")
+	defaultBiome := terrain.FindDefaultBiomeConfig()
 	rasterPath := flag.String("raster", defaultRaster, "Path to real-world DEM elevation raster image (e.g. images/World_elevation_map.png)")
+	biomePath := flag.String("biome-config", defaultBiome, "Path to user-tunable JSON biome configuration file (e.g. config/biomes.json)")
 	focusEnable := flag.Bool("focus-enable", false, "Enable steered high-density focus area (default 10 sq miles)")
 	focusLat := flag.Float64("focus-lat", 0.0, "Focus area center latitude in degrees (-90 to 90)")
 	focusLon := flag.Float64("focus-lon", 0.0, "Focus area center longitude in degrees (-180 to 180)")
@@ -52,11 +54,19 @@ func main() {
 	}
 
 	geoTIFFs := terrain.FindDefaultGeoTIFFs()
+	gebcoFiles := terrain.FindDefaultGEBCOFiles()
 
 	actualResLat := *resLat
 	actualResLon := *resLon
 	if actualResLat <= 0 || actualResLon <= 0 {
-		if *rasterPath != "" {
+		if len(gebcoFiles) >= 8 {
+			if actualResLon <= 0 {
+				actualResLon = 43200
+			}
+			if actualResLat <= 0 {
+				actualResLat = 21600
+			}
+		} else if *rasterPath != "" {
 			if w, h, err := terrain.GetRasterDimensions(*rasterPath); err == nil && w > 0 && h > 0 {
 				if actualResLon <= 0 {
 					actualResLon = w
@@ -76,7 +86,7 @@ func main() {
 
 	actualPatches := *patches
 	if actualPatches <= 0 {
-		if actualResLon >= 4000 || len(geoTIFFs) > 0 {
+		if actualResLon >= 4000 || len(gebcoFiles) > 0 || len(geoTIFFs) > 0 {
 			actualPatches = 8 // 384 chunks for optimal high-res LOD partition
 		}
 	}
@@ -92,7 +102,9 @@ func main() {
 	fmt.Printf("Resolution: %d x %d (Auto native source limit)\n", actualResLon, actualResLat)
 	fmt.Printf("Elevation: Scale=%.2f km, Offset=%.2f | Overlap=%.2f | Thickness=%.3f\n",
 		*elevScale, *elevOffset, *overlap, *thickness)
-	if *rasterPath != "" {
+	if len(gebcoFiles) >= 8 {
+		fmt.Printf("🗺️ Global 1km GEBCO Mosaic: Found %d quadrant tiles (43,200 × 21,600 Native 1km Resolution)\n", len(gebcoFiles))
+	} else if *rasterPath != "" {
 		if _, err := os.Stat(*rasterPath); err == nil {
 			fmt.Printf("🗺️ DEM Raster: %s (Real-World Topography & Bathymetry)\n", *rasterPath)
 		} else {
@@ -142,7 +154,9 @@ func main() {
 		ThicknessFactor: *thickness,
 		SeaLevel:        143.0 / 255.0,
 		RasterPath:      *rasterPath,
+		GEBCOPaths:      gebcoFiles,
 		GeoTIFFPaths:    geoTIFFs,
+		BiomeConfigPath: *biomePath,
 		FocusArea: terrain.DensityZone{
 			Enabled:           *focusEnable,
 			CenterLat:         actualFocusLat,

@@ -1,0 +1,161 @@
+{
+  "sea_level": 0.56215,
+  "equator_snowline_m": 4800,
+  "pole_snowline_m": 0,
+  "snow_color": [
+    245,
+    250,
+    255
+  ],
+  "cliff_slope_threshold": 0.28,
+  "cliff_color": [
+    74,
+    72,
+    70
+  ],
+  "desert_belt_enabled": true,
+  "bathymetry_bands": [
+    {
+      "name": "Abyssal Trench & Deep Ocean (-11000m to -4000m)",
+      "max_depth_frac": 0.60,
+      "color_start": [
+        10,
+        28,
+        65
+      ],
+      "color_end": [
+        18,
+        55,
+        120
+      ]
+    },
+    {
+      "name": "Continental Slope & Mid-Depth (-4000m to -500m)",
+      "max_depth_frac": 0.92,
+      "color_start": [
+        18,
+        55,
+        120
+      ],
+      "color_end": [
+        35,
+        105,
+        170
+      ]
+    },
+    {
+      "name": "Coastal Shelf & Reefs (-500m to 0m)",
+      "max_depth_frac": 1.00,
+      "color_start": [
+        35,
+        105,
+        170
+      ],
+      "color_end": [
+        55,
+        180,
+        225
+      ]
+    }
+  ],
+  "land_bands": [
+    {
+      "name": "Immediate Shoreline & Beach Fringe (0m - 2m)",
+      "max_elev_m": 2.0,
+      "color_start": [
+        248,
+        235,
+        175
+      ],
+      "color_end": [
+        215,
+        195,
+        140
+      ]
+    },
+    {
+      "name": "Humid Coastal Lowlands & Subtropics (2m - 180m)",
+      "max_elev_m": 180.0,
+      "color_start": [
+        32,
+        148,
+        62
+      ],
+      "color_end": [
+        48,
+        162,
+        72
+      ]
+    },
+    {
+      "name": "Temperate Interior Lowlands & Farmland (180m - 450m)",
+      "max_elev_m": 450.0,
+      "color_start": [
+        55,
+        155,
+        60
+      ],
+      "color_end": [
+        105,
+        165,
+        68
+      ]
+    },
+    {
+      "name": "Continental Great Plains & Prairies (450m - 1500m)",
+      "max_elev_m": 1500.0,
+      "color_start": [
+        185,
+        160,
+        85
+      ],
+      "color_end": [
+        208,
+        178,
+        105
+      ]
+    },
+    {
+      "name": "High Continental Plateaus & Intermountain Basins (1500m - 2500m)",
+      "max_elev_m": 2500.0,
+      "color_start": [
+        185,
+        148,
+        105
+      ],
+      "color_end": [
+        165,
+        125,
+        92
+      ]
+    },
+    {
+      "name": "Subalpine Highlands & Montane Conifers (2500m - 3800m)",
+      "max_elev_m": 3800.0,
+      "color_start": [
+        145,
+        125,
+        98
+      ],
+      "color_end": [
+        112,
+        110,
+        105
+      ]
+    },
+    {
+      "name": "High Alpine Ridges & Scree (3800m - 8848m)",
+      "max_elev_m": 8848.0,
+      "color_start": [
+        112,
+        110,
+        105
+      ],
+      "color_end": [
+        185,
+        182,
+        180
+      ]
+    }
+  ]
+}

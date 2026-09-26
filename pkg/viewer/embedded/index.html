@@ -89,10 +89,15 @@
                     <button class="seg-btn" id="btn-mode-orbit">Orbit</button>
                 </div>
                 <div class="nav-help" id="fly-help">
-                    <small><b>WASD</b>: Move | <b>Q/E</b>: Roll | <b>Space/C</b>: Up/Down | <b>Drag</b>: 6-DOF Look | <b>Scroll</b>: Speed</small>
+                    <small><b>WASD</b>: Move | <b>Q/E</b>: Roll | <b>H/N</b>: Level Horizon | <b>Space/C</b>: Up/Down | <b>Drag</b>: Look</small>
                 </div>
                 <div class="nav-help hidden" id="orbit-help">
                     <small><b>Left Drag</b>: Rotate | <b>Right Drag</b>: Pan | <b>Scroll</b>: Zoom</small>
+                </div>
+                <div style="display: flex; gap: 6px; margin-top: 6px;">
+                    <button id="btn-level-horizon" class="action-btn" style="flex: 1; border: 1px solid rgba(255, 255, 255, 0.2); color: rgba(255, 255, 255, 0.7);" title="Toggle continuous auto-level flight along planet curvature (H)">
+                        <span id="btn-level-text">✈️ Auto-Horizon: OFF (H)</span>
+                    </button>
                 </div>
                 <div style="display: flex; gap: 6px; margin-top: 6px;">
                     <button id="btn-frame-planet" class="action-btn secondary-btn" style="flex: 1;">
@@ -149,6 +154,16 @@
                 </div>
 
                 <div class="select-control">
+                    <label for="select-kernel">Splat Profile (Kernel)</label>
+                    <select id="select-kernel">
+                        <option value="0" selected>Seamless Square Surfel (Airtight Grid Coverage)</option>
+                        <option value="1">Rounded Square Surfel (Super-Elliptic)</option>
+                        <option value="2">Circular Surfel Disc</option>
+                        <option value="3">Soft Volumetric Gaussian</option>
+                    </select>
+                </div>
+
+                <div class="select-control">
                     <label for="select-shading">Color & Shading Mode</label>
                     <select id="select-shading">
                         <option value="0">Realistic Satellite Biomes</option>
@@ -158,6 +173,12 @@
                     </select>
                 </div>
 
+                <div class="checkbox-control">
+                    <label>
+                        <input type="checkbox" id="check-depth-test" checked>
+                        <span><b>🛡️ Hardware Depth Occlusion (Z-Buffer)</b></span>
+                    </label>
+                </div>
                 <div class="checkbox-control">
                     <label>
                         <input type="checkbox" id="check-spheroid-grid" checked>

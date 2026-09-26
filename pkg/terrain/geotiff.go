@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -417,21 +418,26 @@ func (m *GeoTIFFMosaic) MinPixelScaleMeters() float64 {
 	return minScale
 }
 
-// FindDefaultGeoTIFFs finds any USGS 1-meter GeoTIFF files in images/ or workspace root.
+// FindDefaultGeoTIFFs finds any USGS 1-meter local LiDAR GeoTIFF files in images/ or workspace root.
 func FindDefaultGeoTIFFs() []string {
 	var paths []string
 	patterns := []string{
 		"images/USGS_1M_*.tif",
-		"images/*.tif",
 		"USGS_1M_*.tif",
+		"images/*.tif",
 		"*.tif",
-		"../../images/*.tif",
+		"../../images/USGS_1M_*.tif",
 	}
 
 	seen := make(map[string]bool)
 	for _, pat := range patterns {
 		matches, _ := filepath.Glob(pat)
 		for _, m := range matches {
+			base := strings.ToLower(filepath.Base(m))
+			// Exclude global GEBCO quadrant tiles (managed separately by GEBCOMosaic)
+			if strings.HasPrefix(base, "gebco_") {
+				continue
+			}
 			if !seen[m] {
 				seen[m] = true
 				paths = append(paths, m)

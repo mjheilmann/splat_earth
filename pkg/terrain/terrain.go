@@ -52,7 +52,11 @@ type GeneratorConfig struct {
 	CurvatureTolerance float64 // Height deviation threshold in km/units to subdivide quad cells (e.g. 0.12 km)
 
 	RasterPath   string   `json:"rasterPath,omitempty"`   // Path to real-world DEM raster image (e.g. "images/World_elevation_map.png")
+	GEBCOPaths   []string `json:"gebcoPaths,omitempty"`   // Paths to 1km global GEBCO GeoTIFF quadrant tiles (e.g. "images/gebco_08_*.tif")
 	GeoTIFFPaths []string `json:"geotiffPaths,omitempty"` // Paths to high-resolution local GeoTIFF LiDAR DEMs (e.g. "images/USGS_1M_*.tif")
+
+	BiomeConfigPath string      `json:"biomeConfigPath,omitempty"` // Path to custom JSON biome configuration file (e.g. "config/biomes.json")
+	Biome           BiomeConfig `json:"biome"`                     // Loaded biome hypsometric configuration
 
 	FocusArea  DensityZone   `json:"focusArea"`  // Primary steered high-density area of interest
 	FocusAreas []DensityZone `json:"focusAreas"` // Optional multiple steered focus areas
@@ -75,11 +79,24 @@ func (cfg *GeneratorConfig) ActiveFocusAreas() []DensityZone {
 // DefaultConfig returns parameters for a complete oblate spheroid terrain.
 func DefaultConfig() GeneratorConfig {
 	rasterPath := FindDefaultElevationRaster()
+	gebcoFiles := FindDefaultGEBCOFiles()
 	geoTIFFs := FindDefaultGeoTIFFs()
+	biomePath := FindDefaultBiomeConfig()
+
+	biomeCfg := DefaultBiomeConfig()
+	if biomePath != "" {
+		if loaded, err := LoadBiomeConfigFile(biomePath); err == nil {
+			biomeCfg = loaded
+		}
+	}
 
 	seaLevel := 0.30
-	if rasterPath != "" || len(geoTIFFs) > 0 {
-		seaLevel = 143.0 / 255.0 // ~0.5607 sea level in World_elevation_map.png
+	if rasterPath != "" || len(gebcoFiles) > 0 || len(geoTIFFs) > 0 {
+		if biomeCfg.SeaLevel > 0 {
+			seaLevel = biomeCfg.SeaLevel
+		} else {
+			seaLevel = 143.35 / 255.0 // ~0.56215 true sea level in standard DEM
+		}
 	}
 
 	focusArea := DensityZone{
@@ -99,14 +116,21 @@ func DefaultConfig() GeneratorConfig {
 		focusArea.DensityMultiplier = 64.0
 	}
 
+	stepsLat := 150
+	stepsLon := 300
+	if len(gebcoFiles) >= 8 {
+		stepsLat = 21600
+		stepsLon = 43200
+	}
+
 	return GeneratorConfig{
 		Spheroid:           spheroid.NewSpheroid(100.0, spheroid.WGS84Flattening), // Scaled spheroid: radius 100, WGS-84 flattening (0.335%)
 		LatMin:             -90.0,
 		LatMax:             90.0,
 		LonMin:             -180.0,
 		LonMax:             180.0,
-		StepsLat:           150,
-		StepsLon:           300,
+		StepsLat:           stepsLat,
+		StepsLon:           stepsLon,
 		ElevationScale:     1.0, // Realistic elevation scale: 1.0 km visual relief (0.311 km for true 1:1 physical scale)
 		ElevationOffset:    0.0,
 		BaseElevation:      0.0,
@@ -116,7 +140,10 @@ func DefaultConfig() GeneratorConfig {
 		AdaptiveDensity:    false,
 		CurvatureTolerance: 0.12,
 		RasterPath:         rasterPath,
+		GEBCOPaths:         gebcoFiles,
 		GeoTIFFPaths:       geoTIFFs,
+		BiomeConfigPath:    biomePath,
+		Biome:              biomeCfg,
 		FocusArea:          focusArea,
 		FocusAreas:         nil,
 	}
@@ -126,6 +153,7 @@ func DefaultConfig() GeneratorConfig {
 type TerrainGenerator struct {
 	config  GeneratorConfig
 	raster  *ElevationRaster
+	gebco   *GEBCOMosaic
 	geoTIFF *GeoTIFFMosaic
 }
 
@@ -187,9 +215,20 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 		cfg.StepsLon = 2
 	}
 
+	var gebco *GEBCOMosaic
+	gebcoPaths := cfg.GEBCOPaths
+	if len(gebcoPaths) == 0 {
+		gebcoPaths = FindDefaultGEBCOFiles()
+	}
+	if len(gebcoPaths) >= 8 {
+		if m, err := LoadGEBCOMosaic(gebcoPaths); err == nil {
+			gebco = m
+		}
+	}
+
 	var raster *ElevationRaster
 	rasterPath := cfg.RasterPath
-	if rasterPath == "" {
+	if rasterPath == "" && gebco == nil {
 		rasterPath = FindDefaultElevationRaster()
 	}
 
@@ -213,9 +252,31 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 		}
 	}
 
+	if cfg.BiomeConfigPath != "" {
+		if loaded, err := LoadBiomeConfigFile(cfg.BiomeConfigPath); err == nil {
+			cfg.Biome = loaded
+		}
+	} else if len(cfg.Biome.LandBands) == 0 {
+		biomePath := FindDefaultBiomeConfig()
+		if biomePath != "" {
+			if loaded, err := LoadBiomeConfigFile(biomePath); err == nil {
+				cfg.Biome = loaded
+			} else {
+				cfg.Biome = DefaultBiomeConfig()
+			}
+		} else {
+			cfg.Biome = DefaultBiomeConfig()
+		}
+	}
+
+	if cfg.Biome.SeaLevel > 0 {
+		cfg.SeaLevel = cfg.Biome.SeaLevel
+	}
+
 	return &TerrainGenerator{
 		config:  cfg,
 		raster:  raster,
+		gebco:   gebco,
 		geoTIFF: geoTIFF,
 	}
 }
@@ -266,7 +327,7 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 
 					capRadius := float32(0.5 * targetSpacing * cfg.OverlapFactor * 1.2)
 					quat := cfg.Spheroid.OrientationQuaternion(lat, 0, slopeE*0.1, slopeN*0.1)
-					color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+					color := tg.computeBiomeColor(lat, 0, elevNorm, slopeE, slopeN)
 
 					ringSplats[i] = []splat.Splat{{
 						Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
@@ -313,13 +374,15 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 
 					localDensity := tg.GetDensityMultiplier(lat, lon)
 					scaleFactor := 1.0 / math.Sqrt(localDensity)
+					stretchE := math.Sqrt(1.0 + slopeE*slopeE)
+					stretchN := math.Sqrt(1.0 + slopeN*slopeN)
 
-					sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * scaleFactor)
-					sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * scaleFactor)
+					sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * scaleFactor * stretchE)
+					sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * scaleFactor * stretchN)
 					sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor * scaleFactor)
 
 					quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE, slopeN)
-					color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+					color := tg.computeBiomeColor(lat, lon, elevNorm, slopeE, slopeN)
 
 					rowSplats = append(rowSplats, splat.Splat{
 						Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
@@ -394,7 +457,23 @@ func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
 		}
 	}
 
-	// 2. Global DEM heightmap layer
+	// 2. High-Resolution Global 1km GEBCO Mosaic layer (43,200 x 21,600)
+	if tg.gebco != nil {
+		elev, isLand := tg.gebco.Sample(sea, lat, lon)
+		if isLand {
+			return elev
+		}
+		// In ocean areas, query raster layer for detailed ocean floor bathymetry if available
+		if tg.raster != nil {
+			rElev := tg.raster.Sample(lat, lon)
+			if rElev < sea {
+				return rElev
+			}
+		}
+		return elev
+	}
+
+	// 3. Global DEM heightmap layer (21,600 x 10,800 fallback)
 	if tg.raster != nil {
 		return tg.raster.Sample(lat, lon)
 	}
@@ -403,73 +482,9 @@ func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
 	return 0.5607
 }
 
-// computeBiomeColor maps elevation and slope to satellite-realistic terrain colors.
-func (tg *TerrainGenerator) computeBiomeColor(elev, slopeE, slopeN float64) [4]uint8 {
-	elev = clampFloat(elev, 0.0, 1.0)
-	slopeMag := math.Sqrt(slopeE*slopeE + slopeN*slopeN)
-	sea := tg.config.SeaLevel
-
-	var r, g, b float64
-	alpha := uint8(255)
-
-	landSpan := 1.0 - sea
-	if landSpan < 0.05 {
-		landSpan = 0.05
-	}
-
-	if elev < sea*0.65 {
-		// Deep Abyssal Trench
-		t := elev / (sea * 0.65)
-		r = lerpFloat(t, 12, 20)
-		g = lerpFloat(t, 35, 65)
-		b = lerpFloat(t, 85, 140)
-	} else if elev < sea {
-		// Shallow Coastal / Coral Shelf
-		t := (elev - sea*0.65) / (sea * 0.35)
-		r = lerpFloat(t, 20, 40)
-		g = lerpFloat(t, 65, 145)
-		b = lerpFloat(t, 140, 185)
-	} else if elev < sea+landSpan*0.04 {
-		// Sandy Beaches & Coastal Plains
-		r, g, b = 218, 202, 150
-	} else if elev < sea+landSpan*0.28 {
-		// Lush Lowland Plains & Forests
-		t := (elev - (sea + landSpan*0.04)) / (landSpan * 0.24)
-		r = lerpFloat(t, 45, 65)
-		g = lerpFloat(t, 145, 125)
-		b = lerpFloat(t, 45, 40)
-	} else if elev < sea+landSpan*0.55 {
-		// Subalpine Woodlands & Highlands
-		t := (elev - (sea + landSpan*0.28)) / (landSpan * 0.27)
-		r = lerpFloat(t, 65, 95)
-		g = lerpFloat(t, 125, 110)
-		b = lerpFloat(t, 40, 65)
-	} else if elev < sea+landSpan*0.80 {
-		// Mountain Slopes, Scree & High Ridges
-		t := (elev - (sea + landSpan*0.55)) / (landSpan * 0.25)
-		r = lerpFloat(t, 95, 140)
-		g = lerpFloat(t, 110, 135)
-		b = lerpFloat(t, 65, 130)
-	} else {
-		// Glacial Snowcaps, Horns & Icefields (Everest, Greenland, Antarctica)
-		t := (elev - (sea + landSpan*0.80)) / (landSpan * 0.20)
-		if t > 1.0 {
-			t = 1.0
-		}
-		r = lerpFloat(t, 140, 248)
-		g = lerpFloat(t, 135, 250)
-		b = lerpFloat(t, 130, 255)
-	}
-
-	// Steep cliff rock shading (slopes > ~15-20 degrees, slopeMag > 0.3)
-	if elev > sea && slopeMag > 0.30 {
-		rockWeight := math.Min((slopeMag-0.30)*1.8, 0.90)
-		r = lerpFloat(rockWeight, r, 75)
-		g = lerpFloat(rockWeight, g, 72)
-		b = lerpFloat(rockWeight, b, 70)
-	}
-
-	return [4]uint8{uint8(clampFloat(r, 0, 255)), uint8(clampFloat(g, 0, 255)), uint8(clampFloat(b, 0, 255)), alpha}
+// computeBiomeColor maps geodetic latitude, longitude, elevation, and slope gradients to satellite-realistic terrain colors.
+func (tg *TerrainGenerator) computeBiomeColor(lat, lon, elev, slopeE, slopeN float64) [4]uint8 {
+	return tg.config.Biome.SampleBiomeColor(tg.config.SeaLevel, lat, lon, elev, slopeE, slopeN)
 }
 
 func lerpFloat(t, a, b float64) float64 {

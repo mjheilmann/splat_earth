@@ -20,7 +20,9 @@
         shadingEnabled: true,   // Dynamic PBR sun lighting & normal shading
         hazeDensity: 0.50,      // Atmospheric Rayleigh haze density
         showGrid: true,
-        depthSort: false,
+        depthTest: true,
+        depthSort: true,
+        autoHorizon: false,
         lodBias: 1.0,
         cameraMode: 'fly', // 'fly' or 'orbit'
         flightSpeed: 50.0,
@@ -118,6 +120,16 @@
 
         // Rotation matrix from normal-aligned quaternion
         mat3 R = quatToMat(a_rotation);
+        vec3 norm = normalize(R[2]);
+
+        // --- Fast GPU Terrain Normal Backface Culling ---
+        // Discard terrain wafers angled away from camera view vector
+        vec3 toCam = u_camPos - center;
+        if (dot(norm, toCam) < -0.05 * length(toCam)) {
+            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+            return;
+        }
+
         // --- Fast GPU Planetary Horizon Culling ---
         // For a spheroid centered at the origin (0,0,0), horizon angle theta_h = acos(clamp(r_planet / distCam, 0.0, 1.0)).
         // A splat is visible if angle(u_cam, u_point) <= theta_h + margin.
@@ -138,85 +150,28 @@
             }
         }
 
-        // Transform center to camera view space
-        vec4 pView = u_view * vec4(center, 1.0);
+        // True 3D Tangent Surface Discs (Surfel Splatting)
+        // Constructs quad vertices directly on the 3D terrain tangent plane in world space
+        vec3 tangentX = R[0];
+        vec3 tangentY = R[1];
+        vec2 scale = a_scale.xy * u_scaleMult;
+
+        // a_quad is (-2,-2) to (2,2) -> normalized local offset (-1,-1) to (1,1)
+        vec2 localOffset = a_quad * 0.5;
+        vec3 worldVertexPos = center + tangentX * (localOffset.x * scale.x) + tangentY * (localOffset.y * scale.y);
+
+        // Transform true 3D surface position to camera view and clip space
+        vec4 pView = u_view * vec4(worldVertexPos, 1.0);
         if (pView.z >= -0.00001) {
             gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
             return;
         }
 
-        vec3 scale = vec3(a_scale.xy * u_scaleMult, a_scale.z * u_thicknessMult);
-        mat3 S = mat3(
-            scale.x, 0.0, 0.0,
-            0.0, scale.y, 0.0,
-            0.0, 0.0, scale.z
-        );
-        mat3 M = R * S;
-        mat3 Sigma = M * transpose(M); // 3D Covariance Ellipsoid
-
-        mat3 W = mat3(u_view);
-
-        // Jacobian of perspective projection at pView
-        float z = pView.z;
-        float z2 = z * z;
-        mat3x2 J = mat3x2(
-            u_focal.x / z, 0.0,
-            0.0, u_focal.y / z,
-            -(u_focal.x * pView.x) / z2, -(u_focal.y * pView.y) / z2
-        );
-
-        // 2D Screen Space Covariance: V = J * W * Sigma * W^T * J^T
-        mat3 W_Sigma_WT = W * Sigma * transpose(W);
-        mat2 V = J * W_Sigma_WT * transpose(J);
-
-        // Anti-aliasing low-pass filter
-        V[0][0] += 0.3;
-        V[1][1] += 0.3;
-
-        // Eigen decomposition of 2x2 covariance matrix V:
-        float a = V[0][0];
-        float b = V[0][1];
-        float c = V[1][1];
-
-        float trace = a + c;
-        float det = a * c - b * b;
-        float term = sqrt(max(0.0001, (a - c) * (a - c) + 4.0 * b * b));
-
-        float lambda1 = max(0.1, (trace + term) * 0.5);
-        float lambda2 = max(0.1, (trace - term) * 0.5);
-
-        // Eigenvector for lambda1
-        vec2 ev1 = vec2(b, lambda1 - a);
-        if (length(ev1) < 1e-4) {
-            ev1 = vec2(1.0, 0.0);
-        } else {
-            ev1 = normalize(ev1);
-        }
-        vec2 ev2 = vec2(-ev1.y, ev1.x);
-
-        // Splat radii in pixels (3 standard deviations)
-        float r1 = min(4096.0, 3.0 * sqrt(lambda1));
-        float r2 = min(4096.0, 3.0 * sqrt(lambda2));
-
-        // Offset in screen pixels
-        vec2 pixelOffset = a_quad.x * ev1 * (r1 / 3.0) + a_quad.y * ev2 * (r2 / 3.0);
-        vec2 ndcOffset = (pixelOffset / u_viewport) * 2.0;
-
-        vec4 clipPos = u_projection * pView;
-        clipPos.xy += ndcOffset * clipPos.w;
-
-        // Fast GPU Frustum Culling
-        if (abs(clipPos.x) > clipPos.w * 1.5 || abs(clipPos.y) > clipPos.w * 1.5 || clipPos.z < -clipPos.w || clipPos.z > clipPos.w * 1.1) {
-            gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
-            return;
-        }
-
-        gl_Position = clipPos;
-        v_uv = a_quad; // (-2,-2) to (2,2)
+        gl_Position = u_projection * pView;
+        v_uv = localOffset; // (-1,-1) to (1,1)
         v_color = a_color;
-        // True physical terrain surface normal from slope quaternion
-        v_normal = normalize(R[2]);
-        v_worldPos = center;
+        v_normal = norm;
+        v_worldPos = worldVertexPos;
         v_altitude = length(center);
     }
     `;
@@ -256,15 +211,28 @@
     }
 
     void main() {
-        // Radially symmetric 2D Gaussian falloff (invariant to screen-space billboard rotation)
-        float d = -0.5 * dot(v_uv, v_uv);
-        if (d < -4.5) {
-            discard; // Beyond 3 sigma
-        }
+        float alpha = 1.0;
 
-        float alpha = exp(d) * v_color.a * u_alphaBoost;
-        if (alpha < 0.02) {
-            discard;
+        if (u_kernelType == 0) {
+            // Seamless Square Surfel: 100% airtight quadrilateral tiling for Cartesian DEM/LiDAR grids
+            if (max(abs(v_uv.x), abs(v_uv.y)) > 1.0) discard;
+            alpha = 1.0;
+        } else if (u_kernelType == 1) {
+            // Rounded Square Surfel: Super-Elliptic boundary (u^4 + v^4 <= 1)
+            float u4 = v_uv.x * v_uv.x * v_uv.x * v_uv.x;
+            float v4 = v_uv.y * v_uv.y * v_uv.y * v_uv.y;
+            if (u4 + v4 > 1.0) discard;
+            alpha = 1.0;
+        } else if (u_kernelType == 2) {
+            // Circular Surfel Disc (u^2 + v^2 <= 1)
+            if (dot(v_uv, v_uv) > 1.0) discard;
+            alpha = 1.0;
+        } else {
+            // Soft Volumetric Gaussian
+            float r2 = dot(v_uv, v_uv);
+            if (r2 > 1.0) discard;
+            alpha = exp(-2.0 * r2) * v_color.a * u_alphaBoost;
+            if (alpha < 0.05) discard;
         }
 
         vec3 baseColor = v_color.rgb;
@@ -1259,16 +1227,9 @@
                     targetLOD = 4;
                 }
 
-                // Smooth crossfade LOD management
+                ch.desiredLOD = targetLOD;
                 if (ch.currentLOD === undefined) {
                     ch.currentLOD = targetLOD;
-                    ch.prevLOD = null;
-                    ch.fadeStart = 0;
-                } else if (ch.currentLOD !== targetLOD && ch.prevLOD === null) {
-                    ch.prevLOD = ch.currentLOD;
-                    ch.currentLOD = targetLOD;
-                    ch.fadeStart = performance.now();
-                    state.hasActiveLODFade = true;
                 }
             }
 
@@ -1281,68 +1242,56 @@
             // Preload any missing chunk LODs in parallel
             const fetchPromises = [];
             for (const ch of visibleList) {
-                if (!ch.lods[ch.currentLOD]) {
-                    fetchPromises.push(loadChunkLOD(ch.id, ch.currentLOD));
+                if (!ch.lods[ch.desiredLOD]) {
+                    fetchPromises.push(loadChunkLOD(ch.id, ch.desiredLOD));
                 }
-                if (ch.prevLOD !== null && ch.prevLOD !== undefined && !ch.lods[ch.prevLOD]) {
-                    fetchPromises.push(loadChunkLOD(ch.id, ch.prevLOD));
+                if (ch.currentLOD !== undefined && !ch.lods[ch.currentLOD]) {
+                    fetchPromises.push(loadChunkLOD(ch.id, ch.currentLOD));
                 }
             }
             if (fetchPromises.length > 0) {
                 await Promise.all(fetchPromises);
             }
 
-            // Assemble active splat buffers with smooth LOD alpha crossfading
-            if (state.chunks.length > 0 && visibleChunks > 0) {
-                const now = performance.now();
-                const FADE_DURATION = 350; // 350ms seamless crossfade
-                let hasOngoingFade = false;
+            // Promote chunks to desired LOD once data is ready in RAM
+            for (const ch of visibleList) {
+                if (ch.desiredLOD !== undefined && ch.lods[ch.desiredLOD]) {
+                    ch.currentLOD = ch.desiredLOD;
+                }
+            }
 
-                // Sort visible chunks BACK-TO-FRONT (furthest first, closest last) so foreground terrain correctly renders on top
+            // Assemble active splat buffers seamlessly without holes or flashing
+            if (state.chunks.length > 0 && visibleChunks > 0) {
+                // Sort visible chunks BACK-TO-FRONT (furthest first, closest last)
                 visibleList.sort((a, b) => (b.distToCam || 0) - (a.distToCam || 0));
 
                 const loadedEntries = [];
                 let totalActive = 0;
 
                 for (const ch of visibleList) {
-                    let currWeight = 1.0;
-                    let prevWeight = 0.0;
-
-                    if (ch.prevLOD !== null && ch.prevLOD !== undefined) {
-                        const elapsed = now - ch.fadeStart;
-                        const progress = Math.min(1.0, elapsed / FADE_DURATION);
-                        if (progress >= 1.0) {
-                            ch.prevLOD = null;
-                        } else {
-                            hasOngoingFade = true;
-                            // Smooth Hermite blend curve: 3t^2 - 2t^3
-                            const t = progress * progress * (3.0 - 2.0 * progress);
-                            currWeight = t;
-                            prevWeight = 1.0 - t;
+                    // Prefer current/desired LOD, or fallback to any loaded LOD in RAM so chunks never flash black
+                    let data = ch.lods[ch.currentLOD] || ch.lods[ch.desiredLOD];
+                    let usedLOD = ch.currentLOD;
+                    if (!data) {
+                        for (let l = 0; l < 5; l++) {
+                            if (ch.lods[l]) {
+                                data = ch.lods[l];
+                                usedLOD = l;
+                                break;
+                            }
                         }
                     }
 
-                    // Current LOD splats
-                    const currData = ch.lods[ch.currentLOD];
-                    if (currData && currWeight > 0.01) {
-                        loadedEntries.push({ data: currData, weight: currWeight, id: ch.id, lod: ch.currentLOD });
-                        totalActive += currData.count;
-                    }
-
-                    // Previous LOD splats during crossfade
-                    if (ch.prevLOD !== null && prevWeight > 0.01) {
-                        const prevData = ch.lods[ch.prevLOD];
-                        if (prevData) {
-                            loadedEntries.push({ data: prevData, weight: prevWeight, id: ch.id, lod: ch.prevLOD });
-                            totalActive += prevData.count;
-                        }
+                    if (data && data.count > 0) {
+                        loadedEntries.push({ data: data, weight: 1.0, id: ch.id, lod: usedLOD });
+                        totalActive += data.count;
                     }
                 }
 
-                state.hasActiveLODFade = hasOngoingFade;
+                state.hasActiveLODFade = false;
 
                 // Check signature to avoid redundant GPU VBO re-allocations when scene is static
-                const sig = loadedEntries.map(e => `${e.id}:${e.lod}:${hasOngoingFade ? e.weight.toFixed(2) : '1'}`).join(',');
+                const sig = loadedEntries.map(e => `${e.id}:${e.lod}`).join(',');
                 if (sig !== state.lastBufferSig || hasOngoingFade) {
                     state.lastBufferSig = sig;
 
@@ -1458,6 +1407,112 @@
         return denom > 1e-6 ? (a * b) / denom : b;
     }
 
+    // Calculate outward geodetic surface normal (local "Up") for oblate spheroid
+    function getLocalSurfaceNormal(pos, a, f) {
+        const b = a * (1.0 - f);
+        const nx = pos[0] / (a * a);
+        const ny = pos[1] / (a * a);
+        const nz = pos[2] / (b * b);
+        const len = Math.hypot(nx, ny, nz) || 1.0;
+        return [nx / len, ny / len, nz / len];
+    }
+
+    // Level camera to local planetary horizon (align Down with local gravity vector)
+    function levelCameraToSurface(pitchOffsetDeg = 0.0) {
+        if (state.cameraMode !== 'fly') {
+            state.cameraMode = 'fly';
+            const btnFly = document.getElementById('btn-mode-fly');
+            const btnOrbit = document.getElementById('btn-mode-orbit');
+            const flyHelp = document.getElementById('fly-help');
+            const orbitHelp = document.getElementById('orbit-help');
+            if (btnFly) btnFly.classList.add('active');
+            if (btnOrbit) btnOrbit.classList.remove('active');
+            if (flyHelp) flyHelp.classList.remove('hidden');
+            if (orbitHelp) orbitHelp.classList.add('hidden');
+        }
+
+        const cam = state.camera;
+        const a = state.spheroid.radius || 100.0;
+        const f = state.spheroid.flattening || 0.05;
+        const nUp = getLocalSurfaceNormal(cam.pos, a, f);
+
+        // Current look direction
+        const axes = Quat.toAxes(cam.quat);
+        let fwd = axes.forward;
+
+        // Project current forward onto tangent horizon plane
+        const dotUp = fwd[0]*nUp[0] + fwd[1]*nUp[1] + fwd[2]*nUp[2];
+        let horizFwd = [
+            fwd[0] - dotUp * nUp[0],
+            fwd[1] - dotUp * nUp[1],
+            fwd[2] - dotUp * nUp[2]
+        ];
+        let hLen = Math.hypot(horizFwd[0], horizFwd[1], horizFwd[2]);
+
+        // If looking straight down/up, default forward toward local North
+        if (hLen < 1e-4) {
+            const nDotZ = nUp[2];
+            horizFwd = [-nDotZ * nUp[0], -nDotZ * nUp[1], 1.0 - nDotZ * nUp[2]];
+            hLen = Math.hypot(horizFwd[0], horizFwd[1], horizFwd[2]);
+            if (hLen < 1e-4) {
+                horizFwd = [1.0 - nUp[0]*nUp[0], -nUp[0]*nUp[1], -nUp[0]*nUp[2]];
+                hLen = Math.hypot(horizFwd[0], horizFwd[1], horizFwd[2]) || 1.0;
+            }
+        }
+        horizFwd = [horizFwd[0] / hLen, horizFwd[1] / hLen, horizFwd[2] / hLen];
+
+        let finalFwd = horizFwd;
+        let finalUp = nUp;
+        if (pitchOffsetDeg !== 0.0) {
+            const pitchRad = pitchOffsetDeg * Math.PI / 180.0;
+            const cosP = Math.cos(pitchRad);
+            const sinP = Math.sin(pitchRad);
+            finalFwd = [
+                horizFwd[0]*cosP - nUp[0]*sinP,
+                horizFwd[1]*cosP - nUp[1]*sinP,
+                horizFwd[2]*cosP - nUp[2]*sinP
+            ];
+            finalUp = [
+                horizFwd[0]*sinP + nUp[0]*cosP,
+                horizFwd[1]*sinP + nUp[1]*cosP,
+                horizFwd[2]*sinP + nUp[2]*cosP
+            ];
+        }
+
+        cam.quat = Quat.fromLookRotation(finalFwd, finalUp);
+        cam.target = [
+            cam.pos[0] + finalFwd[0],
+            cam.pos[1] + finalFwd[1],
+            cam.pos[2] + finalFwd[2]
+        ];
+    }
+
+    // Toggle continuous auto-horizon flight
+    function toggleAutoHorizon(forceState) {
+        if (forceState !== undefined) {
+            state.autoHorizon = forceState;
+        } else {
+            state.autoHorizon = !state.autoHorizon;
+        }
+
+        const btnText = document.getElementById('btn-level-text');
+        const btnLevel = document.getElementById('btn-level-horizon');
+        if (state.autoHorizon) {
+            if (btnLevel) {
+                btnLevel.classList.add('active');
+                btnLevel.style.borderColor = 'rgba(0, 204, 255, 0.8)';
+            }
+            if (btnText) btnText.innerText = '✈️ Auto-Horizon: ON (H)';
+            levelCameraToSurface();
+        } else {
+            if (btnLevel) {
+                btnLevel.classList.remove('active');
+                btnLevel.style.borderColor = 'rgba(255, 255, 255, 0.2)';
+            }
+            if (btnText) btnText.innerText = '✈️ Auto-Horizon: OFF (H)';
+        }
+    }
+
     // Camera Navigation & Physics Update (Logarithmic Adaptive Speed & 6-DOF Quaternion Controls)
     function updateCamera(dt) {
         const camDist = Math.hypot(state.camera.pos[0], state.camera.pos[1], state.camera.pos[2]);
@@ -1500,6 +1555,9 @@
             if (state.keys['Space']) moveUp += 1;
             if (state.keys['KeyC']) moveUp -= 1;
 
+            const oldPos = [cam.pos[0], cam.pos[1], cam.pos[2]];
+            const oldNorm = getLocalSurfaceNormal(oldPos, state.spheroid.radius, state.spheroid.flattening);
+
             cam.pos[0] += forward[0] * moveFwd * speed + right[0] * moveRight * speed + up[0] * moveUp * speed;
             cam.pos[1] += forward[1] * moveFwd * speed + right[1] * moveRight * speed + up[1] * moveUp * speed;
             cam.pos[2] += forward[2] * moveFwd * speed + right[2] * moveRight * speed + up[2] * moveUp * speed;
@@ -1513,6 +1571,35 @@
                 cam.pos[0] *= pushOut;
                 cam.pos[1] *= pushOut;
                 cam.pos[2] *= pushOut;
+            }
+
+            if (state.autoHorizon) {
+                const newNorm = getLocalSurfaceNormal(cam.pos, state.spheroid.radius, state.spheroid.flattening);
+
+                // Parallel transport of camera quaternion across planet surface curvature
+                const vx = oldNorm[1]*newNorm[2] - oldNorm[2]*newNorm[1];
+                const vy = oldNorm[2]*newNorm[0] - oldNorm[0]*newNorm[2];
+                const vz = oldNorm[0]*newNorm[1] - oldNorm[1]*newNorm[0];
+                const vLen = Math.hypot(vx, vy, vz);
+                if (vLen > 1e-7) {
+                    const dotN = Math.max(-1.0, Math.min(1.0, oldNorm[0]*newNorm[0] + oldNorm[1]*newNorm[1] + oldNorm[2]*newNorm[2]));
+                    const ang = Math.acos(dotN);
+                    const qTrans = Quat.fromAxisAngle([vx/vLen, vy/vLen, vz/vLen], ang);
+                    cam.quat = Quat.normalize(Quat.multiply(qTrans, cam.quat));
+                }
+
+                // Keep roll locked to the local geodetic vertical
+                if (roll === 0) {
+                    const currAxes = Quat.toAxes(cam.quat);
+                    const crossR = [
+                        currAxes.forward[1]*newNorm[2] - currAxes.forward[2]*newNorm[1],
+                        currAxes.forward[2]*newNorm[0] - currAxes.forward[0]*newNorm[2],
+                        currAxes.forward[0]*newNorm[1] - currAxes.forward[1]*newNorm[0]
+                    ];
+                    if (Math.hypot(crossR[0], crossR[1], crossR[2]) > 1e-4) {
+                        cam.quat = Quat.fromLookRotation(currAxes.forward, newNorm);
+                    }
+                }
             }
 
             cam.target = [
@@ -1626,22 +1713,7 @@
             state.lastLODUpdate = time;
         }
 
-        // Render Spheroid Grid
-        if (state.showGrid && gridLineCount > 0) {
-            gl.useProgram(gridProgram);
-            gl.uniformMatrix4fv(gl.getUniformLocation(gridProgram, 'u_mvp'), false, new Float32Array(mvp));
-            gl.uniform4f(gl.getUniformLocation(gridProgram, 'u_gridColor'), 0.0, 0.6, 1.0, 0.25);
-
-            gl.enable(gl.BLEND);
-            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-            gl.disable(gl.DEPTH_TEST);
-
-            gl.bindVertexArray(gridVAO);
-            gl.drawArrays(gl.LINES, 0, gridLineCount);
-            gl.bindVertexArray(null);
-        }
-
-        // Render Active Splats
+        // Render Active Splats (Solid Surface / Volumetric)
         const drawCount = state.activeSplatCount || 0;
         if (drawCount > 0) {
             gl.useProgram(splatProgram);
@@ -1674,12 +1746,41 @@
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_hazeDensity'), state.hazeDensity || 0.50);
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_shadingEnabled'), state.shadingEnabled ? 1 : 0);
 
+            if (state.depthTest) {
+                gl.enable(gl.DEPTH_TEST);
+                gl.depthFunc(gl.LEQUAL);
+                gl.depthMask(true);
+            } else {
+                gl.disable(gl.DEPTH_TEST);
+                gl.depthMask(false);
+            }
+
             gl.enable(gl.BLEND);
             gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-            gl.disable(gl.DEPTH_TEST);
 
             gl.bindVertexArray(splatVAO);
             gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, drawCount);
+            gl.bindVertexArray(null);
+        }
+
+        // Render Spheroid Grid
+        if (state.showGrid && gridLineCount > 0) {
+            gl.useProgram(gridProgram);
+            gl.uniformMatrix4fv(gl.getUniformLocation(gridProgram, 'u_mvp'), false, new Float32Array(mvp));
+            gl.uniform4f(gl.getUniformLocation(gridProgram, 'u_gridColor'), 0.0, 0.6, 1.0, 0.25);
+
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+            if (state.depthTest) {
+                gl.enable(gl.DEPTH_TEST);
+                gl.depthFunc(gl.LEQUAL);
+                gl.depthMask(false);
+            } else {
+                gl.disable(gl.DEPTH_TEST);
+            }
+
+            gl.bindVertexArray(gridVAO);
+            gl.drawArrays(gl.LINES, 0, gridLineCount);
             gl.bindVertexArray(null);
         }
     }
@@ -1687,6 +1788,11 @@
     function setupUI() {
         window.addEventListener('keydown', (e) => {
             state.keys[e.code] = true;
+            if (e.code === 'KeyH') {
+                toggleAutoHorizon();
+            } else if (e.code === 'KeyN') {
+                levelCameraToSurface();
+            }
         });
         window.addEventListener('keyup', (e) => {
             state.keys[e.code] = false;
@@ -1713,12 +1819,18 @@
             if (state.cameraMode === 'fly') {
                 const sensitivity = 0.0025;
                 const axes = Quat.toAxes(state.camera.quat);
-                // Pitch (around local right axis - zero gimbal lock!)
-                const qPitch = Quat.fromAxisAngle(axes.right, -dy * sensitivity);
-                // Yaw (around local up axis)
-                const qYaw = Quat.fromAxisAngle(axes.up, -dx * sensitivity);
-                const qRot = Quat.multiply(qYaw, qPitch);
-                state.camera.quat = Quat.normalize(Quat.multiply(qRot, state.camera.quat));
+                if (state.autoHorizon) {
+                    const nUp = getLocalSurfaceNormal(state.camera.pos, state.spheroid.radius, state.spheroid.flattening);
+                    const qYaw = Quat.fromAxisAngle(nUp, -dx * sensitivity);
+                    const qPitch = Quat.fromAxisAngle(axes.right, -dy * sensitivity);
+                    const qRot = Quat.multiply(qYaw, qPitch);
+                    state.camera.quat = Quat.normalize(Quat.multiply(qRot, state.camera.quat));
+                } else {
+                    const qPitch = Quat.fromAxisAngle(axes.right, -dy * sensitivity);
+                    const qYaw = Quat.fromAxisAngle(axes.up, -dx * sensitivity);
+                    const qRot = Quat.multiply(qYaw, qPitch);
+                    state.camera.quat = Quat.normalize(Quat.multiply(qRot, state.camera.quat));
+                }
             } else {
                 const sensitivity = 0.005;
                 state.camera.orbitTheta -= dx * sensitivity;
@@ -1786,6 +1898,13 @@
             orbitHelp.classList.remove('hidden');
             flyHelp.classList.add('hidden');
         });
+
+        const btnLevel = document.getElementById('btn-level-horizon');
+        if (btnLevel) {
+            btnLevel.addEventListener('click', () => {
+                toggleAutoHorizon();
+            });
+        }
 
         const btnFrame = document.getElementById('btn-frame-planet');
         if (btnFrame) {
@@ -1886,6 +2005,21 @@
         if (checkGrid) {
             checkGrid.addEventListener('change', (e) => {
                 state.showGrid = e.target.checked;
+            });
+        }
+
+        const checkDepthTest = document.getElementById('check-depth-test');
+        if (checkDepthTest) {
+            checkDepthTest.addEventListener('change', (e) => {
+                state.depthTest = e.target.checked;
+            });
+        }
+
+        const checkDepthSort = document.getElementById('check-depth-sort');
+        if (checkDepthSort) {
+            checkDepthSort.addEventListener('change', (e) => {
+                state.depthSort = e.target.checked;
+                state.lastBufferSig = ''; // Force re-assembly
             });
         }
 

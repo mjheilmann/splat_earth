@@ -579,15 +579,20 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 				}
 			}
 
-			sx := float32(0.5 * localSpacing * cfg.OverlapFactor)
-			sy := float32(0.5 * localSpacing * cfg.OverlapFactor)
+			// Metric Slope Stretch Correction:
+			// On a slope, the physical distance along the surface tangent is stretched by sqrt(1 + slope^2)
+			stretchE := math.Sqrt(1.0 + slopeE*slopeE)
+			stretchN := math.Sqrt(1.0 + slopeN*slopeN)
+
+			sx := float32(0.5 * localSpacing * cfg.OverlapFactor * stretchE)
+			sy := float32(0.5 * localSpacing * cfg.OverlapFactor * stretchN)
 			sz := float32(0.5 * localSpacing * cfg.ThicknessFactor)
 
 			// Normal-aligned rotation quaternion
 			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
 
 			// Biome color
-			color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+			color := tg.computeBiomeColor(latDeg, lonDeg, elevNorm, slopeE, slopeN)
 
 			splats = append(splats, splat.Splat{
 				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
@@ -729,12 +734,15 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 	height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 	posECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, height)
 
-	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor)
-	sy := float32(0.5 * cellSpacing * cfg.OverlapFactor)
+	stretchE := math.Sqrt(1.0 + slopeE*slopeE)
+	stretchN := math.Sqrt(1.0 + slopeN*slopeN)
+
+	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor * stretchE)
+	sy := float32(0.5 * cellSpacing * cfg.OverlapFactor * stretchN)
 	sz := float32(0.5 * cellSpacing * cfg.ThicknessFactor)
 
 	quat := cfg.Spheroid.OrientationQuaternion(latMid, lonMid, slopeE, slopeN)
-	color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+	color := tg.computeBiomeColor(latMid, lonMid, elevNorm, slopeE, slopeN)
 
 	*splats = append(*splats, splat.Splat{
 		Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},

@@ -162,7 +162,7 @@ func (tg *TerrainGenerator) generateChunkSplats(footprintScale float64, stride i
 			capRadius := float32(0.5 * targetSpacing * cfg.OverlapFactor * footprintScale * 1.2)
 			capThickness := float32(0.5 * targetSpacing * cfg.ThicknessFactor)
 			quat := cfg.Spheroid.OrientationQuaternion(lat, 0, slopeE*0.1, slopeN*0.1)
-			color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+			color := tg.computeBiomeColor(lat, 0, elevNorm, slopeE, slopeN)
 
 			splats = append(splats, splat.Splat{
 				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
@@ -206,13 +206,16 @@ func (tg *TerrainGenerator) generateChunkSplats(footprintScale float64, stride i
 			// Compute 3D ECEF position
 			posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
 
+			stretchE := math.Sqrt(1.0 + slopeE*slopeE)
+			stretchN := math.Sqrt(1.0 + slopeN*slopeN)
+
 			// Bloated footprint scale for lower LODs to prevent pinholes
-			sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * footprintScale)
-			sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * footprintScale)
+			sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * footprintScale * stretchE)
+			sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * footprintScale * stretchN)
 			sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor)
 
 			quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE*0.1, slopeN*0.1)
-			color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
+			color := tg.computeBiomeColor(lat, lon, elevNorm, slopeE, slopeN)
 
 			splats = append(splats, splat.Splat{
 				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
