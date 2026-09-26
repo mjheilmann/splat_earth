@@ -365,6 +365,58 @@ func (m *GeoTIFFMosaic) Sample(lat, lon float64) (float64, bool) {
 	return 0, false
 }
 
+// Contains returns true if the coordinate is within any tile's exact bounding box.
+func (m *GeoTIFFMosaic) Contains(lat, lon float64) bool {
+	if m == nil || len(m.Tiles) == 0 {
+		return false
+	}
+	if lat < m.LatMin || lat > m.LatMax || lon < m.LonMin || lon > m.LonMax {
+		return false
+	}
+	for _, tile := range m.Tiles {
+		if lat >= tile.LatMin && lat <= tile.LatMax && lon >= tile.LonMin && lon <= tile.LonMax {
+			return true
+		}
+	}
+	return false
+}
+
+// Intersects returns true if the bounding box intersects any tile in the mosaic.
+func (m *GeoTIFFMosaic) Intersects(latMin, latMax, lonMin, lonMax float64) bool {
+	if m == nil || len(m.Tiles) == 0 {
+		return false
+	}
+	if latMax < m.LatMin || latMin > m.LatMax || lonMax < m.LonMin || lonMin > m.LonMax {
+		return false
+	}
+	for _, tile := range m.Tiles {
+		if !(latMax < tile.LatMin || latMin > tile.LatMax || lonMax < tile.LonMin || lonMin > tile.LonMax) {
+			return true
+		}
+	}
+	return false
+}
+
+// MinPixelScaleMeters returns the finest horizontal resolution in meters among all tiles in the mosaic.
+func (m *GeoTIFFMosaic) MinPixelScaleMeters() float64 {
+	if m == nil || len(m.Tiles) == 0 {
+		return 1.0
+	}
+	minScale := m.Tiles[0].PixelScaleX
+	for _, t := range m.Tiles {
+		if t.PixelScaleX > 0 && t.PixelScaleX < minScale {
+			minScale = t.PixelScaleX
+		}
+		if t.PixelScaleY > 0 && t.PixelScaleY < minScale {
+			minScale = t.PixelScaleY
+		}
+	}
+	if minScale <= 0 {
+		minScale = 1.0
+	}
+	return minScale
+}
+
 // FindDefaultGeoTIFFs finds any USGS 1-meter GeoTIFF files in images/ or workspace root.
 func FindDefaultGeoTIFFs() []string {
 	var paths []string

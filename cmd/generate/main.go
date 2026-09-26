@@ -19,16 +19,16 @@ func main() {
 	outFile := flag.String("out", "splats/terrain.splat", "Output file path (.splat or .ply)")
 	format := flag.String("format", "", "Output format: 'splat' or 'ply' (auto-detected from -out if omitted)")
 	radius := flag.Float64("radius", 100.0, "Equatorial radius of the oblate spheroid (km)")
-	flattening := flag.Float64("flattening", 0.05, "Flattening ratio f = (a - b) / a (e.g. 0.05 for 5% oblateness)")
+	flattening := flag.Float64("flattening", spheroid.WGS84Flattening, "Flattening ratio f = (a - b) / a (0.0033528 for WGS-84)")
 	latMin := flag.Float64("lat-min", -90.0, "Minimum latitude in degrees (-90 to 90)")
 	latMax := flag.Float64("lat-max", 90.0, "Maximum latitude in degrees (-90 to 90)")
 	lonMin := flag.Float64("lon-min", -180.0, "Minimum longitude in degrees (-180 to 180)")
 	lonMax := flag.Float64("lon-max", 180.0, "Maximum longitude in degrees (-180 to 180)")
 	geometry := flag.String("geometry", "cubed-sphere", "Patch geometry: 'cubed-sphere' (recommended, no polar distortion) or 'latlon'")
-	patches := flag.Int("patches", 0, "Patches per face axis for cubed-sphere (0 = Auto density-adaptive, or explicit e.g. 4 => 96 patches)")
-	resLat := flag.Int("res-lat", 150, "Grid resolution along latitude (points)")
-	resLon := flag.Int("res-lon", 300, "Grid resolution along longitude (points)")
-	elevScale := flag.Float64("elev-scale", 12.0, "Max terrain elevation scale (km/units)")
+	patches := flag.Int("patches", 0, "Patches per face axis (0 = Auto optimal, e.g. 8 => 384 chunks)")
+	resLat := flag.Int("res-lat", 0, "Grid resolution along latitude (0 = Auto native source height e.g. 10800)")
+	resLon := flag.Int("res-lon", 0, "Grid resolution along longitude (0 = Auto native source width e.g. 21600)")
+	elevScale := flag.Float64("elev-scale", 1.0, "Max terrain elevation scale in km (1.0 km for subtle relief, 0.311 km for true 1:1 physical scale)")
 	elevOffset := flag.Float64("elev-offset", 0.0, "Baseline elevation offset (-0.5 to +0.5)")
 	overlap := flag.Float64("overlap", 1.35, "Splat size overlap factor for continuous coverage")
 	thickness := flag.Float64("thickness", 0.035, "Splat normal thickness factor")
@@ -51,14 +51,45 @@ func main() {
 		}
 	}
 
+	geoTIFFs := terrain.FindDefaultGeoTIFFs()
+
+	actualResLat := *resLat
+	actualResLon := *resLon
+	if actualResLat <= 0 || actualResLon <= 0 {
+		if *rasterPath != "" {
+			if w, h, err := terrain.GetRasterDimensions(*rasterPath); err == nil && w > 0 && h > 0 {
+				if actualResLon <= 0 {
+					actualResLon = w
+				}
+				if actualResLat <= 0 {
+					actualResLat = h
+				}
+			}
+		}
+		if actualResLat <= 0 {
+			actualResLat = 150
+		}
+		if actualResLon <= 0 {
+			actualResLon = 300
+		}
+	}
+
+	actualPatches := *patches
+	if actualPatches <= 0 {
+		if actualResLon >= 4000 || len(geoTIFFs) > 0 {
+			actualPatches = 8 // 384 chunks for optimal high-res LOD partition
+		}
+	}
+
 	fmt.Println("==================================================")
 	fmt.Println("   Gaussian Splat Spheroid Terrain Generator      ")
 	fmt.Println("==================================================")
-	fmt.Printf("Geometry: %s (Patches=%d per face axis [0=Auto])\n", *geometry, *patches)
+	fmt.Printf("Geometry: %s (Patches=%d per face axis -> %d chunks)\n", *geometry, actualPatches, 6*actualPatches*actualPatches)
 	fmt.Printf("Spheroid: Radius=%.1f km, Flattening=%.4f (Polar Radius=%.1f km)\n",
 		*radius, *flattening, *radius*(1.0-*flattening))
 	fmt.Printf("Bounds: Lat [%.1f, %.1f] deg, Lon [%.1f, %.1f] deg\n",
 		*latMin, *latMax, *lonMin, *lonMax)
+	fmt.Printf("Resolution: %d x %d (Auto native source limit)\n", actualResLon, actualResLat)
 	fmt.Printf("Elevation: Scale=%.2f km, Offset=%.2f | Overlap=%.2f | Thickness=%.3f\n",
 		*elevScale, *elevOffset, *overlap, *thickness)
 	if *rasterPath != "" {
@@ -68,9 +99,14 @@ func main() {
 			fmt.Printf("⚠️ Raster specified at '%s' not found, using baseline spheroid\n", *rasterPath)
 		}
 	}
-	geoTIFFs := terrain.FindDefaultGeoTIFFs()
 	if len(geoTIFFs) > 0 {
-		fmt.Printf("🏔️ High-Res LiDAR DEMs: Found %d GeoTIFF tiles (1-meter LiDAR Focus Layer)\n", len(geoTIFFs))
+		mosaic, _ := terrain.LoadGeoTIFFMosaic(geoTIFFs)
+		if mosaic != nil {
+			fmt.Printf("🏔️ High-Res LiDAR DEMs: Found %d GeoTIFF tiles (Auto-Detected: %.2f-meter Native Resolution)\n",
+				len(geoTIFFs), mosaic.MinPixelScaleMeters())
+		} else {
+			fmt.Printf("🏔️ High-Res LiDAR DEMs: Found %d GeoTIFF tiles (1-meter LiDAR Focus Layer)\n", len(geoTIFFs))
+		}
 	}
 
 	actualFocusLat := *focusLat
@@ -97,8 +133,8 @@ func main() {
 		LatMax:          *latMax,
 		LonMin:          *lonMin,
 		LonMax:          *lonMax,
-		StepsLat:        *resLat,
-		StepsLon:        *resLon,
+		StepsLat:        actualResLat,
+		StepsLon:        actualResLon,
 		ElevationScale:  *elevScale,
 		ElevationOffset: *elevOffset,
 		BaseElevation:   0.0,
@@ -126,7 +162,7 @@ func main() {
 
 	if outFormat == "splat" && strings.ToLower(*geometry) != "latlon" {
 		fmt.Printf("Generating compressed indexed multi-LOD splat container directly to %s...\n", *outFile)
-		err := gen.WriteContainer(*outFile, *patches)
+		err := gen.WriteContainer(*outFile, actualPatches)
 		if err != nil {
 			fmt.Printf("\nError generating container: %v\n", err)
 			os.Exit(1)
@@ -137,7 +173,7 @@ func main() {
 		if strings.ToLower(*geometry) == "latlon" {
 			splats = gen.Generate()
 		} else {
-			splats = gen.GenerateCubedSphereSplats(*patches)
+			splats = gen.GenerateCubedSphereSplats(actualPatches)
 		}
 		genDuration := time.Since(startTime)
 		fmt.Printf(" Done (%v) - Generated %d splats\n", genDuration, len(splats))

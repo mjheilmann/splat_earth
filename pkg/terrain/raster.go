@@ -23,6 +23,21 @@ var (
 	cachedPath    string
 )
 
+// GetRasterDimensions reads image header metadata to inspect width and height in O(1) without decoding pixel buffers.
+func GetRasterDimensions(filePath string) (width, height int, err error) {
+	f, err := os.Open(filePath)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer f.Close()
+
+	cfg, _, err := image.DecodeConfig(f)
+	if err != nil {
+		return 0, 0, err
+	}
+	return cfg.Width, cfg.Height, nil
+}
+
 // LoadElevationRaster loads and converts an equirectangular image into an optimized grayscale DEM buffer.
 // It caches the parsed raster in RAM to avoid redundant I/O and decoding across generator invocations.
 func LoadElevationRaster(filePath string) (*ElevationRaster, error) {

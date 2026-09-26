@@ -100,14 +100,14 @@ func DefaultConfig() GeneratorConfig {
 	}
 
 	return GeneratorConfig{
-		Spheroid:           spheroid.NewSpheroid(100.0, 0.05), // Scaled spheroid: radius 100, 5% flattening
+		Spheroid:           spheroid.NewSpheroid(100.0, spheroid.WGS84Flattening), // Scaled spheroid: radius 100, WGS-84 flattening (0.335%)
 		LatMin:             -90.0,
 		LatMax:             90.0,
 		LonMin:             -180.0,
 		LonMax:             180.0,
 		StepsLat:           150,
 		StepsLon:           300,
-		ElevationScale:     12.0, // High relief mountains up to 12 km
+		ElevationScale:     1.0, // Realistic elevation scale: 1.0 km visual relief (0.311 km for true 1:1 physical scale)
 		ElevationOffset:    0.0,
 		BaseElevation:      0.0,
 		OverlapFactor:      1.35,
@@ -132,15 +132,21 @@ type TerrainGenerator struct {
 // GetDensityMultiplier returns the steered density boost factor at (lat, lon).
 func (tg *TerrainGenerator) GetDensityMultiplier(lat, lon float64) float64 {
 	activeZones := tg.config.ActiveFocusAreas()
-	if len(activeZones) == 0 {
-		return 1.0
+	maxMult := 1.0
+
+	// 1. Direct GeoTIFF DEM file bounding box matching
+	if tg.geoTIFF != nil && tg.geoTIFF.Contains(lat, lon) {
+		maxMult = 64.0
+		if len(activeZones) > 0 && activeZones[0].DensityMultiplier > maxMult {
+			maxMult = activeZones[0].DensityMultiplier
+		}
 	}
 
-	maxMult := 1.0
+	// 2. Custom active focus zones
 	for _, zone := range activeZones {
-		mult := zone.DensityMultiplier
-		if mult < 1.0 {
-			mult = 1.0
+		m := zone.DensityMultiplier
+		if m < 1.0 {
+			m = 1.0
 		}
 		radius := zone.RadiusKm()
 		trans := zone.TransitionWidthKm
@@ -150,14 +156,14 @@ func (tg *TerrainGenerator) GetDensityMultiplier(lat, lon float64) float64 {
 
 		dist := tg.config.Spheroid.SurfaceDistance(lat, lon, zone.CenterLat, zone.CenterLon)
 		if dist <= radius {
-			if mult > maxMult {
-				maxMult = mult
+			if m > maxMult {
+				maxMult = m
 			}
 		} else if dist < radius+trans {
 			t := (dist - radius) / trans
 			// Cosine smooth falloff
 			w := 0.5 * (1.0 + math.Cos(math.Pi*t))
-			val := 1.0 + (mult-1.0)*w
+			val := 1.0 + (m-1.0)*w
 			if val > maxMult {
 				maxMult = val
 			}
@@ -255,12 +261,12 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 
 				if math.Abs(lat) >= 89.99 {
 					elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, 0)
-					height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+					height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 					posECEF := cfg.Spheroid.GeodeticToECEF(lat, 0, height)
 
 					capRadius := float32(0.5 * targetSpacing * cfg.OverlapFactor * 1.2)
 					quat := cfg.Spheroid.OrientationQuaternion(lat, 0, slopeE*0.1, slopeN*0.1)
-					color := tg.computeBiomeColor(elevNorm+cfg.ElevationOffset, slopeE, slopeN)
+					color := tg.computeBiomeColor(elevNorm, slopeE, slopeN)
 
 					ringSplats[i] = []splat.Splat{{
 						Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
@@ -302,7 +308,7 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 					}
 
 					elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, lon)
-					height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+					height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 					posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
 
 					localDensity := tg.GetDensityMultiplier(lat, lon)

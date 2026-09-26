@@ -54,33 +54,32 @@ For ultra-high resolution focus zones (down to 1-meter physical resolution), dow
 
 ### 1. Generate Terrain Splats
 ```bash
-# Generate real Earth elevation splats from the DEM map (saved to terrain.splat)
-go run ./cmd/generate -raster images/World_elevation_map.png -out terrain.splat -res-lat 150 -res-lon 300
+# Generate full native resolution Earth splats (auto-detects 21,600 x 10,800 + 1m LiDAR DEMs)
+go run ./cmd/generate -out splats/world.splat
 
-# Or generate with a steered 10 sq mile high-resolution focus area in the Himalayas:
-go run ./cmd/generate -out terrain.splat -focus-enable -focus-lat 27.98 -focus-lon 86.92 -focus-area 10.0 -focus-boost 64
+# Or generate a fast low-resolution preview by opting into custom lat/lon steps:
+go run ./cmd/generate -res-lat 150 -res-lon 300 -out splats/preview.splat
 
-# Or generate a standard 3DGS binary PLY file
-go run ./cmd/generate -out terrain.ply -format ply
+# Or generate for exact 1:1 true-scale physical elevation:
+go run ./cmd/generate -elev-scale 0.311 -out splats/world_truescale.splat
 ```
 
 #### Generator Flags:
 | Flag | Default | Description |
 |---|---|---|
-| `-out` | `terrain.splat` | Output path (`.splat` or `.ply`) |
+| `-out` | `splats/terrain.splat` | Output path (`.splat` or `.ply`) |
 | `-raster` | `images/World_elevation_map.png` | Path to equirectangular DEM raster |
 | `-radius` | `100.0` | Equatorial radius $a$ (km) |
-| `-flattening` | `0.05` | Flattening $f = (a - b) / a$ (0 for sphere, 0.00335 for WGS-84) |
-| `-lat-min`, `-lat-max` | `-90.0`, `90.0` | Latitude extent in degrees (Poles to Poles) |
-| `-lon-min`, `-lon-max` | `-180.0`, `180.0` | Longitude extent in degrees (Full 360° Globe) |
-| `-res-lat`, `-res-lon` | `150`, `300` | Resolution (Lat rings & Equator base for Equal-Area sampling) |
-| `-elev-scale` | `12.0` | Peak elevation height (km) |
+| `-flattening` | `0.0033528` | WGS-84 standard flattening $f = (a - b) / a$ (0.335% oblateness) |
+| `-res-lat`, `-res-lon` | `0` (Auto) | Grid resolution (`0` = Auto native source limit, e.g. $10,800 \times 21,600$) |
+| `-patches` | `0` (Auto) | Patches per face axis (`0` = Auto optimal, e.g. `8` => 384 chunks) |
+| `-elev-scale` | `1.0` | Peak elevation height (km) (1.0 km subtle relief, 0.311 km for true 1:1) |
 | `-overlap` | `1.35` | Splat tangent overlap multiplier |
 | `-thickness` | `0.035` | Normal thickness ratio (surface-flat disc alignment) |
-| `-focus-enable` | `false` | Enable steered high-density focus area (default 10 sq miles) |
+| `-focus-enable` | `false` | Enable manual steered high-density focus area (LiDAR GeoTIFFs auto-detected) |
 | `-focus-lat`, `-focus-lon` | `0.0`, `0.0` | Focus area center coordinates |
 | `-focus-area` | `10.0` | Focus area size in square miles |
-| `-focus-boost` | `64.0` | Density boost multiplier in focus area (e.g. 16x - 128x) |
+| `-focus-boost` | `64.0` | Density boost multiplier in focus area |
 
 ---
 

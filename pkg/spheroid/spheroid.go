@@ -16,10 +16,13 @@ type Spheroid struct {
 	Eccentricity2 float64 // e^2
 }
 
+// WGS84Flattening is the standard physical Earth flattening factor (1 / 298.257223563 ~ 0.00335281066).
+const WGS84Flattening = 1.0 / 298.257223563
+
 // WGS84 returns the standard WGS-84 reference ellipsoid in real-world meters.
 func WGS84() Spheroid {
 	a := 6378137.0
-	f := 1.0 / 298.257223563
+	f := WGS84Flattening
 	b := a * (1.0 - f)
 	e2 := (a*a - b*b) / (a * a)
 	return Spheroid{

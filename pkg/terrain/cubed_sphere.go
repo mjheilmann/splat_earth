@@ -222,11 +222,11 @@ func (tg *TerrainGenerator) GenerateCubedSphereTerrain(patchesPerFaceAxis int) *
 				s3 := computeLODStride(pointsPerPatchSide, 3)
 				s4 := computeLODStride(pointsPerPatchSide, 4)
 
-				lod0 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s0)
-				lod1 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s1)
-				lod2 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s2)
-				lod3 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s3)
-				lod4 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s4)
+				lod0 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s0, 0)
+				lod1 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s1, 1)
+				lod2 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s2, 2)
+				lod3 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s3, 3)
+				lod4 := tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, task.uMin, task.uMax, task.vMin, task.vMax, pointsPerPatchSide, patchesPerFaceAxis, s4, 4)
 
 				center, radius, normal := computePatchBounds(lod0, cfg.Spheroid, fCenter, fUAxis, fVAxis, (task.uMin+task.uMax)*0.5, (task.vMin+task.vMax)*0.5)
 
@@ -401,7 +401,7 @@ func (p *ProceduralCubedSphere) SampleChunkLOD(chunkID int, lod int) []splat.Spl
 	stride := computeLODStride(p.PointsPerPatchSide, lod)
 
 	tg := NewTerrainGenerator(p.Config)
-	return tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, uMin, uMax, vMin, vMax, p.PointsPerPatchSide, patchesPerFace, stride)
+	return tg.sampleCubedSpherePatch(cubeFace, fCenter, fUAxis, fVAxis, uMin, uMax, vMin, vMax, p.PointsPerPatchSide, patchesPerFace, stride, lod)
 }
 
 // GenerateCubedSphereSplats generates a single combined slice of LOD 0 splats across all 6 faces of the cubed spheroid.
@@ -426,6 +426,7 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	res int,
 	patchesPerFaceAxis int,
 	stride int,
+	lod int,
 ) []splat.Splat {
 	cfg := tg.config
 
@@ -442,29 +443,77 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 		baseDepth = 1
 	}
 
-	activeZones := cfg.ActiveFocusAreas()
-	hasSteeredDensity := len(activeZones) > 0
+	toLatLon := func(u, v float64) (float64, float64) {
+		cX := fCenter.X + u*fUAxis.X + v*fVAxis.X
+		cY := fCenter.Y + u*fUAxis.Y + v*fVAxis.Y
+		cZ := fCenter.Z + u*fUAxis.Z + v*fVAxis.Z
+		lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
+		if lenC < 1e-6 {
+			lenC = 1.0
+		}
+		latRad := math.Asin(math.Max(-1.0, math.Min(1.0, cZ/lenC)))
+		lonRad := math.Atan2(cY, cX)
+		return latRad * 180.0 / math.Pi, lonRad * 180.0 / math.Pi
+	}
 
-	if cfg.AdaptiveDensity || hasSteeredDensity {
+	lat00, lon00 := toLatLon(uMin, vMin)
+	lat10, lon10 := toLatLon(uMax, vMin)
+	lat01, lon01 := toLatLon(uMin, vMax)
+	lat11, lon11 := toLatLon(uMax, vMax)
+
+	pLatMin := math.Min(math.Min(lat00, lat10), math.Min(lat01, lat11))
+	pLatMax := math.Max(math.Max(lat00, lat10), math.Max(lat01, lat11))
+	pLonMin := math.Min(math.Min(lon00, lon10), math.Min(lon01, lon11))
+	pLonMax := math.Max(math.Max(lon00, lon10), math.Max(lon01, lon11))
+
+	activeZones := cfg.ActiveFocusAreas()
+	patchHasFocus := false
+	if lod < 4 {
+		if tg.geoTIFF != nil && tg.geoTIFF.Intersects(pLatMin, pLatMax, pLonMin, pLonMax) {
+			patchHasFocus = true
+		}
+		if !patchHasFocus {
+			patchMidLat, patchMidLon := toLatLon((uMin+uMax)*0.5, (vMin+vMax)*0.5)
+			d00 := cfg.Spheroid.SurfaceDistance(patchMidLat, patchMidLon, lat00, lon00)
+			d10 := cfg.Spheroid.SurfaceDistance(patchMidLat, patchMidLon, lat10, lon10)
+			d01 := cfg.Spheroid.SurfaceDistance(patchMidLat, patchMidLon, lat01, lon01)
+			d11 := cfg.Spheroid.SurfaceDistance(patchMidLat, patchMidLon, lat11, lon11)
+			patchRadiusKm := math.Max(math.Max(d00, d10), math.Max(d01, d11))
+
+			for _, z := range activeZones {
+				radius := z.RadiusKm()
+				trans := z.TransitionWidthKm
+				if trans <= 0 {
+					trans = math.Max(0.5, radius*0.6)
+				}
+				dist := cfg.Spheroid.SurfaceDistance(patchMidLat, patchMidLon, z.CenterLat, z.CenterLon)
+				if dist <= radius+trans+patchRadiusKm {
+					patchHasFocus = true
+					break
+				}
+			}
+		}
+	}
+
+	if cfg.AdaptiveDensity || patchHasFocus {
 		maxFocusDepth := baseDepth
-		for _, z := range activeZones {
-			mult := z.DensityMultiplier
-			if mult < 2.0 {
-				mult = 2.0
+		if patchHasFocus {
+			// Multi-tier smooth high-resolution LOD pyramid in DEM/focus areas:
+			// LOD 0: target 3m-8m ultra-dense LiDAR resolution (depth up to 12)
+			// LOD 1: depth - 1 (4x reduction)
+			// LOD 2: depth - 2 (16x reduction)
+			// LOD 3: depth - 3 (64x reduction)
+			// LOD 4: baseDepth (uniform global orbit)
+			boost := 5 - lod
+			if boost < 0 {
+				boost = 0
 			}
-			boost := int(math.Ceil(0.5 * math.Log2(mult))) + 1
-			if boost < 2 {
-				boost = 2
+			maxFocusDepth = baseDepth + boost
+			if maxFocusDepth > 12 {
+				maxFocusDepth = 12
 			}
-			depthForZone := baseDepth + boost
-			if depthForZone < 6 {
-				depthForZone = 6 // Ensure crisp microscopic detail in focus zone
-			}
-			if depthForZone > 11 {
-				depthForZone = 11
-			}
-			if depthForZone > maxFocusDepth {
-				maxFocusDepth = depthForZone
+			if maxFocusDepth < baseDepth {
+				maxFocusDepth = baseDepth
 			}
 		}
 
@@ -516,16 +565,18 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 
 			// Sample elevation noise and slopes
 			elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latDeg, lonDeg)
-			height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+			height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 
 			// Transform to Oblate Spheroid ECEF Cartesian position
 			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
 
 			// Gaussian Splat Scale: Tangent footprint matching local density spacing
-			localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
 			localSpacing := splatSpacing
-			if localDensity > 1.0 {
-				localSpacing = splatSpacing / math.Sqrt(localDensity)
+			if lod == 0 {
+				localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
+				if localDensity > 1.0 {
+					localSpacing = splatSpacing / math.Sqrt(localDensity)
+				}
 			}
 
 			sx := float32(0.5 * localSpacing * cfg.OverlapFactor)
@@ -611,25 +662,21 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 	quadRadiusKm := cellSpacing * 0.7071
 
 	targetDepth := baseDepth
+
+	if tg.geoTIFF != nil {
+		latMinQ := math.Min(math.Min(lat00, lat10), math.Min(lat01, lat11))
+		latMaxQ := math.Max(math.Max(lat00, lat10), math.Max(lat01, lat11))
+		lonMinQ := math.Min(math.Min(lon00, lon10), math.Min(lon01, lon11))
+		lonMaxQ := math.Max(math.Max(lon00, lon10), math.Max(lon01, lon11))
+
+		if tg.geoTIFF.Intersects(latMinQ, latMaxQ, lonMinQ, lonMaxQ) {
+			targetDepth = maxFocusDepth
+		}
+	}
+
 	activeZones := cfg.ActiveFocusAreas()
-
 	for _, z := range activeZones {
-		mult := z.DensityMultiplier
-		if mult < 2.0 {
-			mult = 2.0
-		}
-		boost := int(math.Ceil(0.5 * math.Log2(mult))) + 1
-		if boost < 2 {
-			boost = 2
-		}
-		zoneTargetDepth := baseDepth + boost
-		if zoneTargetDepth < 6 {
-			zoneTargetDepth = 6
-		}
-		if zoneTargetDepth > maxFocusDepth {
-			zoneTargetDepth = maxFocusDepth
-		}
-
+		zoneTargetDepth := maxFocusDepth
 		radius := z.RadiusKm()
 		trans := z.TransitionWidthKm
 		if trans <= 0 {
@@ -679,7 +726,7 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 
 	// Leaf cell: Emit single adaptive splat covering this cell
 	elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latMid, lonMid)
-	height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+	height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 	posECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, height)
 
 	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor)

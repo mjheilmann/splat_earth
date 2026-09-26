@@ -7,7 +7,7 @@
         splats: null,
         splatCount: 0,
         activeSplatCount: 0,
-        spheroid: { radius: 100.0, flattening: 0.05 },
+        spheroid: { radius: 100.0, flattening: 0.00335281066 }, // WGS-84 standard (0.335% oblateness)
         scaleMultiplier: 1.0,
         thicknessMultiplier: 0.35,
         alphaBoost: 1.0,
@@ -128,7 +128,10 @@
             vec3 ptNorm = center / ptDist;
             float cosHoriz = min(1.0, max(0.0, min(camDist, ptDist) / max(camDist, ptDist)));
             float horizonAngle = acos(cosHoriz);
-            float minCos = cos(min(3.14159, horizonAngle + 0.15));
+            // Dynamic altitude-adaptive horizon margin (tight at low altitude to prevent over-the-horizon backface bleed)
+            float altRel = max(0.0, camDist - ptDist) / max(1.0, ptDist);
+            float horizMargin = clamp(0.005 + 0.15 * sqrt(altRel), 0.005, 0.12);
+            float minCos = cos(min(3.14159, horizonAngle + horizMargin));
             if (dot(camNorm, ptNorm) < minCos) {
                 gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
                 return;
@@ -882,8 +885,15 @@
 
                 const infoRadius = document.getElementById('info-radius');
                 if (infoRadius) infoRadius.innerText = `${state.spheroid.radius.toFixed(1)} km`;
+                const infoPolar = document.getElementById('info-polar');
+                const b = state.spheroid.radius * (1.0 - (state.spheroid.flattening || 0.0033528));
+                if (infoPolar) infoPolar.innerText = `${b.toFixed(3)} km`;
                 const infoFlat = document.getElementById('info-flattening');
-                if (infoFlat) infoFlat.innerText = `${state.spheroid.flattening.toFixed(4)} (${(state.spheroid.flattening * 100).toFixed(1)}%)`;
+                if (infoFlat) {
+                    const f = state.spheroid.flattening || 0.0033528;
+                    const pct = f * 100;
+                    infoFlat.innerText = `${f.toFixed(5)} (${pct < 0.1 ? pct.toFixed(3) : pct.toFixed(2)}%)`;
+                }
 
                 // Frame planet on initial load
                 framePlanet();
@@ -1159,6 +1169,7 @@
                 const radius = ch.radius;
 
                 const distToCam = Math.hypot(cX - camPos[0], cY - camPos[1], cZ - camPos[2]);
+                ch.distToCam = distToCam;
 
                 // Camera inside chunk sphere: guaranteed visible, never cull!
                 let isInside = (distToCam <= radius);
@@ -1210,28 +1221,41 @@
                 visibleChunks++;
                 visibleList.push(ch);
 
-                // 5. Angular Screen-Space Splat Pixel Footprint LOD Selection
-                // Measure exact 3D distance to closest terrain chunk boundary/summit rather than distant sea-level ellipsoid
-                const closestDist = Math.max(0.001, distToCam - radius * 0.65);
-                const focalPx = (canvas.height * 0.5) / tanHalfFov;
-                const nominalSpacing = state.meanSpacingKm || 1.0;
-                const projectedSplatPixels = (nominalSpacing / closestDist) * focalPx * bias;
+                // 5. Monotonic Screen-Space Surface Distance & Gaze-Aligned LOD Selection
+                // True distance from camera to the closest point on the chunk surface
+                const surfaceDist = Math.max(0.0, distToCam - radius);
+
+                // Reference metric radius based on planet grid sizing for uniform distance scaling
+                const totalChunks = state.chunks.length || 24;
+                const patchesPerFace = Math.max(2, Math.round(Math.sqrt(totalChunks / 6.0)));
+                const meanChunkRadius = (Math.PI * a) / (2.0 * patchesPerFace);
+                const refRadius = Math.max(1.0, Math.min(radius, meanChunkRadius));
+
+                // Camera gaze alignment bonus: chunks facing the camera center get priority
+                const fwdX = -view[2], fwdY = -view[6], fwdZ = -view[10];
+                const dX = (cX - camPos[0]) / (distToCam || 1.0);
+                const dY = (cY - camPos[1]) / (distToCam || 1.0);
+                const dZ = (cZ - camPos[2]) / (distToCam || 1.0);
+                const dotGaze = fwdX * dX + fwdY * dY + fwdZ * dZ; // 1.0 = dead center of view
+                const gazeBonus = dotGaze > 0.5 ? (1.0 + (dotGaze - 0.5) * 0.4) : 1.0;
+
+                const metricDist = Math.max(0.0, (surfaceDist / refRadius) / (bias * gazeBonus));
 
                 let targetLOD = 0;
-                if (projectedSplatPixels >= 2.2) {
-                    // Full Resolution (LOD 0, stride 1) - Splats occupy >= 2.2 screen pixels
+                if (metricDist <= 1.0) {
+                    // Ground / Immediate Focus: Full Resolution (LOD 0)
                     targetLOD = 0;
-                } else if (projectedSplatPixels >= 0.9) {
-                    // Medium Resolution (LOD 1, stride 2) - 4x reduction
+                } else if (metricDist <= 2.8) {
+                    // Immediate Neighbors: High Resolution (LOD 1, 4x reduction)
                     targetLOD = 1;
-                } else if (projectedSplatPixels >= 0.35) {
-                    // Coarse Resolution (LOD 2, stride 4) - 16x reduction
+                } else if (metricDist <= 6.5) {
+                    // Mid-Range Terrain: Medium Resolution (LOD 2, 16x reduction)
                     targetLOD = 2;
-                } else if (projectedSplatPixels >= 0.12) {
-                    // Orbit Resolution (LOD 3, stride 8) - 64x reduction
+                } else if (metricDist <= 14.0) {
+                    // Far Horizon: Coarse Resolution (LOD 3, 64x reduction)
                     targetLOD = 3;
                 } else {
-                    // Deep Orbit Resolution (LOD 4, stride 16) - 256x reduction!
+                    // Planetary Orbit: Deep Orbit (LOD 4, 256x reduction)
                     targetLOD = 4;
                 }
 
@@ -1273,6 +1297,9 @@
                 const now = performance.now();
                 const FADE_DURATION = 350; // 350ms seamless crossfade
                 let hasOngoingFade = false;
+
+                // Sort visible chunks BACK-TO-FRONT (furthest first, closest last) so foreground terrain correctly renders on top
+                visibleList.sort((a, b) => (b.distToCam || 0) - (a.distToCam || 0));
 
                 const loadedEntries = [];
                 let totalActive = 0;
@@ -1326,26 +1353,72 @@
                         const mergedColors = new Uint8Array(totalActive * 4);
 
                         let offset = 0;
+                        const camX = camPos[0], camY = camPos[1], camZ = camPos[2];
+
                         for (const entry of loadedEntries) {
                             const d = entry.data;
                             const w = entry.weight;
+                            const count = d.count;
 
-                            mergedCenters.set(d.centers, offset * 3);
-                            mergedScales.set(d.scales, offset * 3);
-                            mergedRotations.set(d.rotations, offset * 4);
-
-                            if (w >= 0.99) {
-                                mergedColors.set(d.colors, offset * 4);
-                            } else {
-                                // Apply crossfade transparency weight to alpha channel
-                                const colSlice = new Uint8Array(d.colors.length);
-                                colSlice.set(d.colors);
-                                for (let k = 0; k < d.count; k++) {
-                                    colSlice[k * 4 + 3] = Math.round(d.colors[k * 4 + 3] * w);
+                            // When close to terrain (alt < 20 km), sort intra-chunk splats back-to-front
+                            if (alt < 20.0 && count > 1) {
+                                const distSq = new Float32Array(count);
+                                const idxs = new Int32Array(count);
+                                const c = d.centers;
+                                for (let k = 0; k < count; k++) {
+                                    idxs[k] = k;
+                                    const dx = c[k * 3] - camX;
+                                    const dy = c[k * 3 + 1] - camY;
+                                    const dz = c[k * 3 + 2] - camZ;
+                                    distSq[k] = dx * dx + dy * dy + dz * dz;
                                 }
-                                mergedColors.set(colSlice, offset * 4);
+                                idxs.sort((i, j) => distSq[j] - distSq[i]); // Back-to-front (furthest first)
+
+                                for (let k = 0; k < count; k++) {
+                                    const srcIdx = idxs[k];
+                                    const dstIdx = offset + k;
+
+                                    mergedCenters[dstIdx * 3] = d.centers[srcIdx * 3];
+                                    mergedCenters[dstIdx * 3 + 1] = d.centers[srcIdx * 3 + 1];
+                                    mergedCenters[dstIdx * 3 + 2] = d.centers[srcIdx * 3 + 2];
+
+                                    mergedScales[dstIdx * 3] = d.scales[srcIdx * 3];
+                                    mergedScales[dstIdx * 3 + 1] = d.scales[srcIdx * 3 + 1];
+                                    mergedScales[dstIdx * 3 + 2] = d.scales[srcIdx * 3 + 2];
+
+                                    mergedRotations[dstIdx * 4] = d.rotations[srcIdx * 4];
+                                    mergedRotations[dstIdx * 4 + 1] = d.rotations[srcIdx * 4 + 1];
+                                    mergedRotations[dstIdx * 4 + 2] = d.rotations[srcIdx * 4 + 2];
+                                    mergedRotations[dstIdx * 4 + 3] = d.rotations[srcIdx * 4 + 3];
+
+                                    mergedColors[dstIdx * 4] = d.colors[srcIdx * 4];
+                                    mergedColors[dstIdx * 4 + 1] = d.colors[srcIdx * 4 + 1];
+                                    mergedColors[dstIdx * 4 + 2] = d.colors[srcIdx * 4 + 2];
+                                    if (w >= 0.99) {
+                                        mergedColors[dstIdx * 4 + 3] = d.colors[srcIdx * 4 + 3];
+                                    } else {
+                                        mergedColors[dstIdx * 4 + 3] = Math.round(d.colors[srcIdx * 4 + 3] * w);
+                                    }
+                                }
+                            } else {
+                                mergedCenters.set(d.centers, offset * 3);
+                                mergedScales.set(d.scales, offset * 3);
+                                mergedRotations.set(d.rotations, offset * 4);
+
+                                if (w >= 0.99) {
+                                    mergedColors.set(d.colors, offset * 4);
+                                } else {
+                                    // Apply crossfade transparency weight to alpha channel
+                                    const colSlice = new Uint8Array(d.colors.length);
+                                    colSlice.set(d.colors);
+                                    for (let k = 0; k < count; k++) {
+                                        colSlice[k * 4 + 3] = Math.round(d.colors[k * 4 + 3] * w);
+                                    }
+                                    mergedColors.set(colSlice, offset * 4);
+                                }
                             }
-                            offset += d.count;
+
+                            offset += count;
                         }
 
                         state.activeSplatCount = totalActive;
@@ -1872,7 +1945,7 @@
 
         // Geographic location navigation shortcuts
         const locs = [
-            { id: 'btn-loc-seattle', lat: 47.581, lon: -122.335, alt: 12.0 },
+            { id: 'btn-loc-seattle', lat: 47.581, lon: -122.335, alt: 4.0 },
             { id: 'btn-loc-everest', lat: 27.988, lon: 86.925, alt: 18.0 },
             { id: 'btn-loc-trench', lat: 11.35, lon: 142.2, alt: 22.0 },
             { id: 'btn-loc-canyon', lat: 36.1, lon: -112.1, alt: 16.0 },
