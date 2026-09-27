@@ -283,3 +283,55 @@ func (b *BiomeConfig) SampleBiomeColor(seaLevel float64, lat, lon, elev, slopeE,
 		alpha,
 	}
 }
+
+// SampleSeaSurfaceColor evaluates semi-transparent ocean water surface color based on latitude, longitude, and bed depth.
+func (b *BiomeConfig) SampleSeaSurfaceColor(seaLevel float64, lat, lon, bedElevNorm float64) [4]uint8 {
+	effectiveSea := seaLevel
+	if b.SeaLevel > 0 {
+		effectiveSea = b.SeaLevel
+	}
+
+	// tDepth: 0.0 (deepest trench/abyss) to 1.0 (water surface / shoreline)
+	tDepth := clampFloat(bedElevNorm/math.Max(0.001, effectiveSea), 0.0, 1.0)
+	absLat := math.Abs(lat)
+
+	var r, g, bCol float64
+	var alpha uint8
+
+	if absLat > 68.0 {
+		// Polar icy sea surface
+		r = lerpFloat(tDepth, 110, 180)
+		g = lerpFloat(tDepth, 160, 220)
+		bCol = lerpFloat(tDepth, 210, 245)
+		alpha = uint8(155)
+	} else if tDepth < 0.70 {
+		// Deep Abyssal Ocean & Pelagic Waters: Deep rich sapphire
+		t := tDepth / 0.70
+		r = lerpFloat(t, 16, 28)
+		g = lerpFloat(t, 68, 108)
+		bCol = lerpFloat(t, 142, 185)
+		alpha = uint8(145) // ~57% opacity
+	} else if tDepth < 0.95 {
+		// Continental Shelf & Shallow Seas: Vibrant Azure
+		t := (tDepth - 0.70) / 0.25
+		r = lerpFloat(t, 28, 42)
+		g = lerpFloat(t, 108, 165)
+		bCol = lerpFloat(t, 185, 218)
+		alpha = uint8(130) // ~51% opacity
+	} else {
+		// Tropical Lagoons, Reefs, Beach Shallows: Crystal Aquamarine / Turquoise
+		t := (tDepth - 0.95) / 0.05
+		r = lerpFloat(t, 42, 58)
+		g = lerpFloat(t, 165, 205)
+		bCol = lerpFloat(t, 218, 235)
+		alpha = uint8(115) // ~45% translucent, reveals sandy seabed underneath!
+	}
+
+	return [4]uint8{
+		uint8(clampFloat(r, 0, 255)),
+		uint8(clampFloat(g, 0, 255)),
+		uint8(clampFloat(bCol, 0, 255)),
+		alpha,
+	}
+}
+

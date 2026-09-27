@@ -90,19 +90,19 @@ func TestFixedBudgetLODPopulation(t *testing.T) {
 		t.Fatalf("Expected 6144 chunks, got %d", proc.TotalChunks)
 	}
 
-	// Verify LOD 4 (Orbit) count per chunk is strictly bounded (target 12x12 ~ 13x13 splats)
+	// Verify LOD 4 (Orbit) count per chunk is strictly bounded (target 12x12 ~ 13x13 splats, up to 2x for ocean chunks with sea surface)
 	m0 := proc.Manifests[0]
-	if m0.CountsLOD[4] > 200 {
-		t.Fatalf("Expected Orbit LOD4 count <= 200 splats per chunk, got %d", m0.CountsLOD[4])
+	if m0.CountsLOD[4] > 400 {
+		t.Fatalf("Expected Orbit LOD4 count <= 400 splats per chunk, got %d", m0.CountsLOD[4])
 	}
-	if m0.CountsLOD[3] > 700 {
-		t.Fatalf("Expected LOD3 count <= 700 splats per chunk, got %d", m0.CountsLOD[3])
+	if m0.CountsLOD[3] > 1400 {
+		t.Fatalf("Expected LOD3 count <= 1400 splats per chunk, got %d", m0.CountsLOD[3])
 	}
 
 	// Sample on demand for a chunk
 	splatsLOD4 := proc.SampleChunkLOD(0, 4)
-	if len(splatsLOD4) == 0 || len(splatsLOD4) > 200 {
-		t.Fatalf("Expected LOD4 sample length in [1, 200], got %d", len(splatsLOD4))
+	if len(splatsLOD4) == 0 || len(splatsLOD4) > 400 {
+		t.Fatalf("Expected LOD4 sample length in [1, 400], got %d", len(splatsLOD4))
 	}
 	if len(splatsLOD4) != m0.CountsLOD[4] {
 		t.Fatalf("Expected sample length %d to match manifest count %d", len(splatsLOD4), m0.CountsLOD[4])

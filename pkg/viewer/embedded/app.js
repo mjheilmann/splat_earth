@@ -23,6 +23,8 @@
         depthTest: true,
         depthSort: true,
         autoHorizon: false,
+        showSeaSurface: true,
+        waterOpacity: 1.0,
         lodBias: 1.0,
         cameraMode: 'fly', // 'fly' or 'orbit'
         flightSpeed: 50.0,
@@ -53,6 +55,22 @@
         fpsTimer: performance.now(),
         lastLODUpdate: 0
     };
+
+    // Pre-allocated persistent VBO typed array pool to eliminate GC stalls during flight
+    let pooledCenters = new Float32Array(400000 * 3);
+    let pooledScales = new Float32Array(400000 * 3);
+    let pooledRotations = new Float32Array(400000 * 4);
+    let pooledColors = new Uint8Array(400000 * 4);
+
+    function ensurePoolCapacity(count) {
+        if (pooledCenters.length < count * 3) {
+            const newCap = Math.max(count * 2, 400000);
+            pooledCenters = new Float32Array(newCap * 3);
+            pooledScales = new Float32Array(newCap * 3);
+            pooledRotations = new Float32Array(newCap * 4);
+            pooledColors = new Uint8Array(newCap * 4);
+        }
+    }
 
     // DOM Elements
     const canvas = document.getElementById('gl-canvas');
@@ -191,6 +209,8 @@
     uniform float u_ambientIntensity;
     uniform float u_hazeDensity;
     uniform bool u_shadingEnabled;
+    uniform bool u_showSeaSurface;
+    uniform float u_waterOpacity;
     uniform float u_alphaBoost;
     uniform int u_colorMode;
     uniform int u_kernelType;
@@ -211,9 +231,19 @@
     }
 
     void main() {
+        bool isWater = (v_color.a <= 0.68);
+        if (isWater && !u_showSeaSurface) {
+            discard;
+        }
+
         float alpha = 1.0;
 
-        if (u_kernelType == 0) {
+        if (isWater) {
+            // Seamless airtight square surfel tiling for water surface (no gaps between adjacent tiles)
+            if (max(abs(v_uv.x), abs(v_uv.y)) > 1.0) discard;
+            float baseWaterAlpha = (v_color.a / 0.60);
+            alpha = clamp(baseWaterAlpha * u_waterOpacity * u_alphaBoost * 0.60, 0.02, 1.0);
+        } else if (u_kernelType == 0) {
             // Seamless Square Surfel: 100% airtight quadrilateral tiling for Cartesian DEM/LiDAR grids
             if (max(abs(v_uv.x), abs(v_uv.y)) > 1.0) discard;
             alpha = 1.0;
@@ -231,7 +261,7 @@
             // Soft Volumetric Gaussian
             float r2 = dot(v_uv, v_uv);
             if (r2 > 1.0) discard;
-            alpha = exp(-2.0 * r2) * v_color.a * u_alphaBoost;
+            alpha = exp(-2.0 * r2) * u_alphaBoost;
             if (alpha < 0.05) discard;
         }
 
@@ -255,12 +285,19 @@
             }
         }
 
-        // --- High-Frequency Micro-Relief Noise inside Splats ---
-        // Adds subtle procedural rock/strata micro-grain across each wafer
-        float grain1 = sin(v_uv.x * 9.42 + v_uv.y * 6.28) * cos(v_uv.x * 6.28 - v_uv.y * 12.56);
-        float grain2 = sin(v_uv.x * 18.84 - v_uv.y * 15.70) * 0.5;
-        float microRelief = (grain1 + grain2) * 0.065;
-        baseColor = clamp(baseColor * (1.0 + microRelief), 0.0, 1.0);
+        if (isWater) {
+            // Oceanic subtle wave ripples
+            float wave1 = sin(v_uv.x * 12.56 + v_worldPos.x * 8.0) * cos(v_uv.y * 12.56 + v_worldPos.y * 8.0);
+            float wave2 = sin(v_uv.x * 25.12 - v_uv.y * 18.84) * 0.5;
+            float wave = (wave1 + wave2) * 0.05;
+            baseColor = clamp(baseColor * (1.0 + wave), 0.0, 1.0);
+        } else {
+            // High-Frequency Micro-Relief Noise inside Terrain Splats
+            float grain1 = sin(v_uv.x * 9.42 + v_uv.y * 6.28) * cos(v_uv.x * 6.28 - v_uv.y * 12.56);
+            float grain2 = sin(v_uv.x * 18.84 - v_uv.y * 15.70) * 0.5;
+            float microRelief = (grain1 + grain2) * 0.065;
+            baseColor = clamp(baseColor * (1.0 + microRelief), 0.0, 1.0);
+        }
 
         if (!u_shadingEnabled && u_colorMode == 0) {
             fragColor = vec4(baseColor * alpha, alpha);
@@ -284,11 +321,20 @@
         // Direct warm golden sunlight
         vec3 sunLight = vec3(1.0, 0.95, 0.88) * (wrapDiffuse * u_sunIntensity);
 
-        // Specular Glints on Oceans and Snowcaps
+        // Specular Glints: Only on ocean sea surface and high snowcaps / glaciers (eliminated on undersea cliffs & ocean bed)
         vec3 H = normalize(L + V);
         float NdotH = max(0.0, dot(N, H));
-        float specIntensity = pow(NdotH, 28.0) * 0.22 * max(0.0, NdotL);
-        vec3 specular = vec3(1.0, 0.98, 0.92) * specIntensity;
+        vec3 specular = vec3(0.0);
+
+        if (isWater) {
+            // High-gloss water surface sun specular glint
+            float specIntensity = pow(NdotH, 48.0) * 0.70 * max(0.0, NdotL);
+            specular = vec3(1.0, 0.98, 0.92) * specIntensity;
+        } else if (v_color.r > 0.82 && v_color.g > 0.85 && v_color.b > 0.90) {
+            // Glacial snow / ice sheen
+            float specIntensity = pow(NdotH, 24.0) * 0.12 * max(0.0, NdotL);
+            specular = vec3(1.0, 0.98, 0.95) * specIntensity;
+        }
 
         vec3 litColor = baseColor * (skyAmbient + sunLight) + specular;
 
@@ -1210,16 +1256,16 @@
                 const metricDist = Math.max(0.0, (surfaceDist / refRadius) / (bias * gazeBonus));
 
                 let targetLOD = 0;
-                if (metricDist <= 1.0) {
+                if (metricDist <= 0.35) {
                     // Ground / Immediate Focus: Full Resolution (LOD 0)
                     targetLOD = 0;
-                } else if (metricDist <= 2.8) {
+                } else if (metricDist <= 1.2) {
                     // Immediate Neighbors: High Resolution (LOD 1, 4x reduction)
                     targetLOD = 1;
-                } else if (metricDist <= 6.5) {
+                } else if (metricDist <= 3.5) {
                     // Mid-Range Terrain: Medium Resolution (LOD 2, 16x reduction)
                     targetLOD = 2;
-                } else if (metricDist <= 14.0) {
+                } else if (metricDist <= 8.5) {
                     // Far Horizon: Coarse Resolution (LOD 3, 64x reduction)
                     targetLOD = 3;
                 } else {
@@ -1296,75 +1342,34 @@
                     state.lastBufferSig = sig;
 
                     if (totalActive > 0) {
-                        const mergedCenters = new Float32Array(totalActive * 3);
-                        const mergedScales = new Float32Array(totalActive * 3);
-                        const mergedRotations = new Float32Array(totalActive * 4);
-                        const mergedColors = new Uint8Array(totalActive * 4);
+                        ensurePoolCapacity(totalActive);
 
                         let offset = 0;
-                        const camX = camPos[0], camY = camPos[1], camZ = camPos[2];
 
                         for (const entry of loadedEntries) {
                             const d = entry.data;
                             const w = entry.weight;
                             const count = d.count;
 
-                            // When close to terrain (alt < 20 km), sort intra-chunk splats back-to-front
-                            if (alt < 20.0 && count > 1) {
-                                const distSq = new Float32Array(count);
-                                const idxs = new Int32Array(count);
-                                const c = d.centers;
-                                for (let k = 0; k < count; k++) {
-                                    idxs[k] = k;
-                                    const dx = c[k * 3] - camX;
-                                    const dy = c[k * 3 + 1] - camY;
-                                    const dz = c[k * 3 + 2] - camZ;
-                                    distSq[k] = dx * dx + dy * dy + dz * dz;
-                                }
-                                idxs.sort((i, j) => distSq[j] - distSq[i]); // Back-to-front (furthest first)
+                            pooledCenters.set(d.centers, offset * 3);
+                            pooledScales.set(d.scales, offset * 3);
+                            pooledRotations.set(d.rotations, offset * 4);
 
-                                for (let k = 0; k < count; k++) {
-                                    const srcIdx = idxs[k];
-                                    const dstIdx = offset + k;
-
-                                    mergedCenters[dstIdx * 3] = d.centers[srcIdx * 3];
-                                    mergedCenters[dstIdx * 3 + 1] = d.centers[srcIdx * 3 + 1];
-                                    mergedCenters[dstIdx * 3 + 2] = d.centers[srcIdx * 3 + 2];
-
-                                    mergedScales[dstIdx * 3] = d.scales[srcIdx * 3];
-                                    mergedScales[dstIdx * 3 + 1] = d.scales[srcIdx * 3 + 1];
-                                    mergedScales[dstIdx * 3 + 2] = d.scales[srcIdx * 3 + 2];
-
-                                    mergedRotations[dstIdx * 4] = d.rotations[srcIdx * 4];
-                                    mergedRotations[dstIdx * 4 + 1] = d.rotations[srcIdx * 4 + 1];
-                                    mergedRotations[dstIdx * 4 + 2] = d.rotations[srcIdx * 4 + 2];
-                                    mergedRotations[dstIdx * 4 + 3] = d.rotations[srcIdx * 4 + 3];
-
-                                    mergedColors[dstIdx * 4] = d.colors[srcIdx * 4];
-                                    mergedColors[dstIdx * 4 + 1] = d.colors[srcIdx * 4 + 1];
-                                    mergedColors[dstIdx * 4 + 2] = d.colors[srcIdx * 4 + 2];
-                                    if (w >= 0.99) {
-                                        mergedColors[dstIdx * 4 + 3] = d.colors[srcIdx * 4 + 3];
-                                    } else {
-                                        mergedColors[dstIdx * 4 + 3] = Math.round(d.colors[srcIdx * 4 + 3] * w);
-                                    }
-                                }
+                            if (w >= 0.99) {
+                                pooledColors.set(d.colors, offset * 4);
                             } else {
-                                mergedCenters.set(d.centers, offset * 3);
-                                mergedScales.set(d.scales, offset * 3);
-                                mergedRotations.set(d.rotations, offset * 4);
-
-                                if (w >= 0.99) {
-                                    mergedColors.set(d.colors, offset * 4);
-                                } else {
-                                    // Apply crossfade transparency weight to alpha channel
-                                    const colSlice = new Uint8Array(d.colors.length);
-                                    colSlice.set(d.colors);
-                                    for (let k = 0; k < count; k++) {
-                                        colSlice[k * 4 + 3] = Math.round(d.colors[k * 4 + 3] * w);
+                                // Apply crossfade transparency weight to alpha channel
+                                const colSlice = new Uint8Array(d.colors.length);
+                                colSlice.set(d.colors);
+                                for (let k = 0; k < count; k++) {
+                                    const origA = d.colors[k * 4 + 3];
+                                    if (origA >= 180) {
+                                        colSlice[k * 4 + 3] = Math.max(180, Math.round(origA * w));
+                                    } else {
+                                        colSlice[k * 4 + 3] = Math.min(160, Math.round(origA * w));
                                     }
-                                    mergedColors.set(colSlice, offset * 4);
                                 }
+                                pooledColors.set(colSlice, offset * 4);
                             }
 
                             offset += count;
@@ -1373,16 +1378,16 @@
                         state.activeSplatCount = totalActive;
 
                         gl.bindBuffer(gl.ARRAY_BUFFER, splatCentersVBO);
-                        gl.bufferData(gl.ARRAY_BUFFER, mergedCenters, gl.DYNAMIC_DRAW);
+                        gl.bufferData(gl.ARRAY_BUFFER, pooledCenters.subarray(0, totalActive * 3), gl.DYNAMIC_DRAW);
 
                         gl.bindBuffer(gl.ARRAY_BUFFER, splatScalesVBO);
-                        gl.bufferData(gl.ARRAY_BUFFER, mergedScales, gl.DYNAMIC_DRAW);
+                        gl.bufferData(gl.ARRAY_BUFFER, pooledScales.subarray(0, totalActive * 3), gl.DYNAMIC_DRAW);
 
                         gl.bindBuffer(gl.ARRAY_BUFFER, splatRotationsVBO);
-                        gl.bufferData(gl.ARRAY_BUFFER, mergedRotations, gl.DYNAMIC_DRAW);
+                        gl.bufferData(gl.ARRAY_BUFFER, pooledRotations.subarray(0, totalActive * 4), gl.DYNAMIC_DRAW);
 
                         gl.bindBuffer(gl.ARRAY_BUFFER, splatColorsVBO);
-                        gl.bufferData(gl.ARRAY_BUFFER, mergedColors, gl.DYNAMIC_DRAW);
+                        gl.bufferData(gl.ARRAY_BUFFER, pooledColors.subarray(0, totalActive * 4), gl.DYNAMIC_DRAW);
 
                         document.getElementById('metric-splats').innerText = `${formatLargeNumber(totalActive)} / ${formatLargeNumber(state.splatCount)}`;
                     }
@@ -1729,6 +1734,8 @@
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_scaleMult'), state.scaleMultiplier);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_thicknessMult'), state.thicknessMultiplier);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_alphaBoost'), state.alphaBoost);
+            gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_showSeaSurface'), state.showSeaSurface ? 1 : 0);
+            gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_waterOpacity'), state.waterOpacity || 1.0);
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_colorMode'), state.colorMode);
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_kernelType'), state.kernelType || 0);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_spheroidRadius'), state.spheroid.radius);
@@ -2020,6 +2027,22 @@
             checkDepthSort.addEventListener('change', (e) => {
                 state.depthSort = e.target.checked;
                 state.lastBufferSig = ''; // Force re-assembly
+            });
+        }
+
+        const checkSeaSurface = document.getElementById('check-sea-surface');
+        if (checkSeaSurface) {
+            checkSeaSurface.addEventListener('change', (e) => {
+                state.showSeaSurface = e.target.checked;
+            });
+        }
+
+        const sliderWaterOpacity = document.getElementById('slider-water-opacity');
+        if (sliderWaterOpacity) {
+            sliderWaterOpacity.addEventListener('input', (e) => {
+                state.waterOpacity = parseFloat(e.target.value);
+                const valWater = document.getElementById('val-water-opacity');
+                if (valWater) valWater.innerText = state.waterOpacity.toFixed(2) + 'x';
             });
         }
 

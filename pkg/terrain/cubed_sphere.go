@@ -344,8 +344,18 @@ func (tg *TerrainGenerator) NewProceduralCubedSphere(patchesPerFaceAxis int) *Pr
 				c2 := n2 * n2
 				c3 := n3 * n3
 				c4 := n4 * n4
+				chunkLat := latRad * 180 / math.Pi
+				chunkLon := lonRad * 180 / math.Pi
+				hCenter := tg.sampleHeight(chunkLat, chunkLon)
+				if hCenter < cfg.SeaLevel {
+					c0 *= 2
+					c1 *= 2
+					c2 *= 2
+					c3 *= 2
+					c4 *= 2
+				}
 
-				chunkDensity := tg.GetDensityMultiplier(latRad*180/math.Pi, lonRad*180/math.Pi)
+				chunkDensity := tg.GetDensityMultiplier(chunkLat, chunkLon)
 				if chunkDensity > 1.05 {
 					c0 = int(float64(c0) * chunkDensity)
 				}
@@ -600,6 +610,23 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 				Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
 				Color:    color,
 			})
+
+			if elevNorm < cfg.SeaLevel {
+				seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
+				seaPosECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, seaHeight)
+				seaQuat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, 0, 0)
+				seaColor := tg.computeSeaSurfaceColor(latDeg, lonDeg, elevNorm)
+				seaSx := float32(0.5 * localSpacing * cfg.OverlapFactor)
+				seaSy := float32(0.5 * localSpacing * cfg.OverlapFactor)
+				seaSz := float32(0.5 * localSpacing * cfg.ThicknessFactor * 0.5)
+
+				splats = append(splats, splat.Splat{
+					Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
+					Scale:    [3]float32{seaSx, seaSy, seaSz},
+					Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
+					Color:    seaColor,
+				})
+			}
 		}
 	}
 
@@ -750,6 +777,23 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 		Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
 		Color:    color,
 	})
+
+	if elevNorm < cfg.SeaLevel {
+		seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
+		seaPosECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, seaHeight)
+		seaQuat := cfg.Spheroid.OrientationQuaternion(latMid, lonMid, 0, 0)
+		seaColor := tg.computeSeaSurfaceColor(latMid, lonMid, elevNorm)
+		seaSx := float32(0.5 * cellSpacing * cfg.OverlapFactor)
+		seaSy := float32(0.5 * cellSpacing * cfg.OverlapFactor)
+		seaSz := float32(0.5 * cellSpacing * cfg.ThicknessFactor * 0.5)
+
+		*splats = append(*splats, splat.Splat{
+			Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
+			Scale:    [3]float32{seaSx, seaSy, seaSz},
+			Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
+			Color:    seaColor,
+		})
+	}
 }
 
 func computePatchBounds(splats []splat.Splat, s spheroid.Spheroid, fCenter, fUAxis, fVAxis spheroid.Vec3, midU, midV float64) ([3]float32, float32, [3]float32) {

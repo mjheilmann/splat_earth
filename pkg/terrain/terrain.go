@@ -390,6 +390,23 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 						Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
 						Color:    color,
 					})
+
+					if elevNorm < cfg.SeaLevel {
+						seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
+						seaPosECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, seaHeight)
+						seaQuat := cfg.Spheroid.OrientationQuaternion(lat, lon, 0, 0)
+						seaColor := tg.computeSeaSurfaceColor(lat, lon, elevNorm)
+						seaSx := float32(0.5 * dEastMeters * cfg.OverlapFactor * scaleFactor)
+						seaSy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * scaleFactor)
+						seaSz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor * scaleFactor * 0.5)
+
+						rowSplats = append(rowSplats, splat.Splat{
+							Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
+							Scale:    [3]float32{seaSx, seaSy, seaSz},
+							Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
+							Color:    seaColor,
+						})
+					}
 				}
 				ringSplats[i] = rowSplats
 			}
@@ -485,6 +502,11 @@ func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
 // computeBiomeColor maps geodetic latitude, longitude, elevation, and slope gradients to satellite-realistic terrain colors.
 func (tg *TerrainGenerator) computeBiomeColor(lat, lon, elev, slopeE, slopeN float64) [4]uint8 {
 	return tg.config.Biome.SampleBiomeColor(tg.config.SeaLevel, lat, lon, elev, slopeE, slopeN)
+}
+
+// computeSeaSurfaceColor maps geodetic latitude, longitude, and bed depth to translucent water colors.
+func (tg *TerrainGenerator) computeSeaSurfaceColor(lat, lon, bedElev float64) [4]uint8 {
+	return tg.config.Biome.SampleSeaSurfaceColor(tg.config.SeaLevel, lat, lon, bedElev)
 }
 
 func lerpFloat(t, a, b float64) float64 {
