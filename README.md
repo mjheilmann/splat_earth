@@ -31,62 +31,77 @@ A high-performance Go spike investigating **geometry-less 3D Gaussian Splatting*
 
 ---
 
-### Global Elevation & Bathymetry Base Map
-The engine supports direct sampling from the high-resolution global elevation and ocean bathymetry raster available on Wikimedia Commons:
+### Supported Elevation & Imagery Datasets
 
+The engine features an automatic GeoData Catalog (`pkg/terrain/catalog.go`) that scans the `images/` folder, parses GeoTIFF geokeys, bounding boxes, and projections, and blends the highest-resolution color and topography layers available.
+
+#### 1. NASA Blue Marble: Next Generation (500m Global True Color & Topo/Bathy)
+Directly consume NASA's high-resolution global 500m GeoTIFF imagery and topography tiles:
+- **Source**: [NASA Earth Observatory - Blue Marble: Next Generation](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/)
+- **Base Topography & Bathymetry**: [NASA Blue Marble Base Topography/Bathymetry](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/base-topography-bathymetry/)
+- **Resolution**: 500 meters / pixel ($21,600 \times 21,600$ per quadrant, $86,400 \times 43,200$ global).
+- **Format**: 8-quadrant GeoTIFF tiles (A1, A2, B1, B2, C1, C2, D1, D2).
+- **Usage**: Drop any or all 8 `world.topo.bathy.*_geo.tif` tiles into the `images/` directory. The engine auto-discovers them and maps 24-bit True Color satellite photorealism directly onto the splats.
+
+#### 2. GEBCO Global Ocean Bathymetry & Land Elevation (1km Grid)
+- **Source**: [GEBCO (General Bathymetric Chart of the Oceans)](https://www.gebco.net/)
+- **Resolution**: ~1 km grid ($43,200 \times 21,600$ global).
+- **Format**: 8-quadrant elevation (`gebco_08_rev_elev_*_grey_geo.tif`) and bathymetry (`gebco_08_rev_bath_*_grey_geo.tif`) GeoTIFFs.
+- **Usage**: Drop into `images/` for sub-pixel bilinear-interpolated terrestrial elevation and ocean trench topography.
+
+#### 3. Global Elevation & Bathymetry Fallback Map
 - **Source**: [Wikimedia Commons - File:World elevation map.png](https://commons.wikimedia.org/wiki/File:World_elevation_map.png)
-- **Resolution**: 21,600 × 10,800 pixels (~1.85 km per pixel at the equator)
-- **Format**: Equirectangular projection (covering −180° to +180° Longitude and −90° to +90° Latitude).
-- **Values**: Grayscale elevation where `0` corresponds to Mariana Trench (~−11,000 m), `~143` corresponds to Sea Level (0 m), and `255` corresponds to Mt. Everest (+8,848 m).
+- **Resolution**: 21,600 × 10,800 pixels (~1.85 km per pixel at the equator).
+- **Format**: Equirectangular global grayscale elevation map (0 = −11,000m Mariana Trench, 143 = Sea Level, 255 = +8,848m Mt. Everest).
 
-### High-Resolution Focus Areas (USGS 3DEP LiDAR DEMs)
-For ultra-high resolution focus zones (down to 1-meter physical resolution), download 1-meter GeoTIFF DEM tiles from:
-
+#### 4. High-Resolution Focus Areas (USGS 3DEP 1-Meter LiDAR DEMs)
+For ultra-high resolution focus zones (down to 1-meter physical resolution):
 - **Source**: [USGS 3DEP LiDAR Explorer](https://apps.nationalmap.gov/lidar-explorer/#/)
 - **Resolution**: 1.0 meter / pixel (floating-point GeoTIFF elevation rasters).
 - **Usage**: Drop downloaded `.tif` DEM files into the `images/` folder. The generator automatically detects any DEM tiles present, extracts their geographic bounding boxes (via UTM Zone $\leftrightarrow$ Geodetic projection), and blends them as high-density LiDAR focus layers over the global world heightmap.
 
-> **Note**: `images/` (including `World_elevation_map.png` and all `.tif` files) and `splats/` are ignored in `.gitignore`.
+> **Note**: The `images/` folder and `splats/` output directory are excluded in `.gitignore` so large multi-gigabyte datasets are never committed to git.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Generate Terrain Splats
+### 1. Build and Generate Terrain Splats
 ```bash
-# Generate full native resolution Earth splats (auto-detects 21,600 x 10,800 + 1m LiDAR DEMs)
-go run ./cmd/generate -out splats/world.splat
+# Build the generator and viewer binaries
+go build ./cmd/generate && go build ./cmd/viewer
 
-# Or generate a fast low-resolution preview by opting into custom lat/lon steps:
-go run ./cmd/generate -res-lat 150 -res-lon 300 -out splats/preview.splat
+# Option A: Standard Dramatic Relief (3.2x vertical exaggeration, 1.0 km height scale)
+./generate -out splats/world.splat
 
-# Or generate for exact 1:1 true-scale physical elevation:
-go run ./cmd/generate -elev-scale 0.311 -out splats/world_truescale.splat
+# Option B: True 1:1 Physical Scale (Authentic unexaggerated real-world Earth geometry)
+./generate -elev-scale 0.311 -out splats/world.splat
+
+# Option C: Fast low-resolution preview
+./generate -res-lat 150 -res-lon 300 -out splats/preview.splat
 ```
 
 #### Generator Flags:
 | Flag | Default | Description |
 |---|---|---|
-| `-out` | `splats/terrain.splat` | Output path (`.splat` or `.ply`) |
-| `-raster` | `images/World_elevation_map.png` | Path to equirectangular DEM raster |
-| `-radius` | `100.0` | Equatorial radius $a$ (km) |
-| `-flattening` | `0.0033528` | WGS-84 standard flattening $f = (a - b) / a$ (0.335% oblateness) |
-| `-res-lat`, `-res-lon` | `0` (Auto) | Grid resolution (`0` = Auto native source limit, e.g. $10,800 \times 21,600$) |
+| `-out` | `splats/terrain.splat` | Output path (`.splat` multi-LOD container or `.ply`) |
+| `-elev-scale` | `1.0` | Peak elevation scale in km (`1.0` = 3.2x dramatic relief, `0.311` = true 1:1 physical scale) |
+| `-elev-offset` | `0.0` | Baseline elevation offset (-0.5 to +0.5) |
+| `-radius` | `100.0` | Equatorial radius $a$ in km (WGS-84 oblate spheroid model) |
+| `-flattening` | `0.0033528` | WGS-84 standard flattening ratio $f = (a - b) / a$ (0.335%) |
+| `-res-lat`, `-res-lon` | `0` (Auto) | Global raster grid resolution (`0` = Auto native source limit, e.g. $21,600 \times 43,200$) |
 | `-patches` | `0` (Auto) | Patches per face axis (`0` = Auto optimal, e.g. `8` => 384 chunks) |
-| `-elev-scale` | `1.0` | Peak elevation height (km) (1.0 km subtle relief, 0.311 km for true 1:1) |
-| `-overlap` | `1.35` | Splat tangent overlap multiplier |
+| `-overlap` | `1.38` | Splat footprint overlap multiplier (gapless coverage) |
 | `-thickness` | `0.035` | Normal thickness ratio (surface-flat disc alignment) |
-| `-focus-enable` | `false` | Enable manual steered high-density focus area (LiDAR GeoTIFFs auto-detected) |
-| `-focus-lat`, `-focus-lon` | `0.0`, `0.0` | Focus area center coordinates |
-| `-focus-area` | `10.0` | Focus area size in square miles |
-| `-focus-boost` | `64.0` | Density boost multiplier in focus area |
+| `-raster` | `images/World_elevation_map.png` | Fallback DEM raster path |
+| `-biome-config` | `config/biomes.json` | Path to JSON biome hypsometry & color tuning config |
 
 ---
 
 ### 2. Launch Interactive 3D Viewer
 ```bash
-# Start viewer and automatically open browser at http://localhost:8080
-go run ./cmd/viewer -file terrain.splat -port 8080
+# Start viewer (auto-detects splats/terrain.splat or splats/world.splat)
+./viewer -port 8080
 ```
 
 #### Viewer Navigation Controls:

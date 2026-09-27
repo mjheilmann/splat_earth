@@ -57,7 +57,7 @@ func TestTerrainSlopeOrientation(t *testing.T) {
 	}
 
 	for _, coord := range testCoords {
-		elev, slopeE, slopeN := gen.sampleElevationAndSlopes(coord[0], coord[1])
+		elev, slopeE, slopeN, _ := gen.sampleElevationAndSlopes(coord[0], coord[1])
 		if math.IsNaN(elev) || math.IsNaN(slopeE) || math.IsNaN(slopeN) {
 			t.Fatalf("NaN detected at lat=%v, lon=%v: elev=%v, slopeE=%v, slopeN=%v", coord[0], coord[1], elev, slopeE, slopeN)
 		}

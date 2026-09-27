@@ -1,9 +1,12 @@
 package terrain
 
 import (
+	"fmt"
 	"math"
 	"runtime"
+	"strings"
 	"sync"
+	"time"
 
 	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
 	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
@@ -538,8 +541,8 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 		return splats
 	}
 
-	// Uniform grid sampling fallback
-	splats := make([]splat.Splat, 0, (res/stride)*(res/stride)+1)
+	// Uniform grid sampling with adaptive micro-subdivision for relief/slope cells
+	splats := make([]splat.Splat, 0, (res/stride)*(res/stride)*2+1)
 
 	du := (uMax - uMin) / float64(res)
 	dv := (vMax - vMin) / float64(res)
@@ -547,85 +550,120 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 	splatSpacing := math.Sqrt(patchArea) / ptsPerSide
 
 	for i := 0; i < res; i += stride {
-		// Sample at the centroid of each downsampled grid cell for crisp alignment
-		u := uMin + (float64(i)+float64(stride)*0.5)*du
+		u0 := uMin + float64(i)*du
+		u1 := u0 + float64(stride)*du
+		uMid := (u0 + u1) * 0.5
 
 		for j := 0; j < res; j += stride {
-			v := vMin + (float64(j)+float64(stride)*0.5)*dv
+			v0 := vMin + float64(j)*dv
+			v1 := v0 + float64(stride)*dv
+			vMid := (v0 + v1) * 0.5
 
-			// Spherify cube coordinates: v_cube = center + u*uAxis + v*vAxis
-			cX := fCenter.X + u*fUAxis.X + v*fVAxis.X
-			cY := fCenter.Y + u*fUAxis.Y + v*fVAxis.Y
-			cZ := fCenter.Z + u*fUAxis.Z + v*fVAxis.Z
+			latMid, lonMid := toLatLon(uMid, vMid)
+			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latMid, lonMid)
+			slopeMag := math.Hypot(slopeE, slopeN)
 
-			lenC := math.Sqrt(cX*cX + cY*cY + cZ*cZ)
-			if lenC < 1e-6 {
-				lenC = 1.0
-			}
-			nX := cX / lenC
-			nY := cY / lenC
-			nZ := cZ / lenC
+			// Sample cell corners to detect local elevation span / relief within this cell
+			lat00, lon00 := toLatLon(u0, v0)
+			lat10, lon10 := toLatLon(u1, v0)
+			lat01, lon01 := toLatLon(u0, v1)
+			lat11, lon11 := toLatLon(u1, v1)
 
-			// Convert unit sphere normal to Geodetic Latitude & Longitude
-			latRad := math.Asin(math.Max(-1.0, math.Min(1.0, nZ)))
-			lonRad := math.Atan2(nY, nX)
+			h00 := tg.sampleHeight(lat00, lon00)
+			h10 := tg.sampleHeight(lat10, lon10)
+			h01 := tg.sampleHeight(lat01, lon01)
+			h11 := tg.sampleHeight(lat11, lon11)
 
-			latDeg := latRad * 180.0 / math.Pi
-			lonDeg := lonRad * 180.0 / math.Pi
-
-			// Sample elevation noise and slopes
-			elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latDeg, lonDeg)
-			height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
-
-			// Transform to Oblate Spheroid ECEF Cartesian position
-			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
+			spanH := math.Max(math.Abs(h00-h11), math.Abs(h10-h01)) * cfg.ElevationScale
+			hasCoastline := (elevNorm >= cfg.SeaLevel && (h00 < cfg.SeaLevel || h10 < cfg.SeaLevel || h01 < cfg.SeaLevel || h11 < cfg.SeaLevel)) ||
+				(elevNorm < cfg.SeaLevel && (h00 >= cfg.SeaLevel || h10 >= cfg.SeaLevel || h01 >= cfg.SeaLevel || h11 >= cfg.SeaLevel)) ||
+				math.Abs(elevNorm-cfg.SeaLevel) < 0.005
 
 			// Gaussian Splat Scale: Tangent footprint matching local density spacing
 			localSpacing := splatSpacing
 			if lod == 0 {
-				localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
+				localDensity := tg.GetDensityMultiplier(latMid, lonMid)
 				if localDensity > 1.0 {
 					localSpacing = splatSpacing / math.Sqrt(localDensity)
 				}
 			}
 
-			// Metric Slope Stretch Correction:
-			// On a slope, the physical distance along the surface tangent is stretched by sqrt(1 + slope^2)
-			stretchE := math.Sqrt(1.0 + slopeE*slopeE)
-			stretchN := math.Sqrt(1.0 + slopeN*slopeN)
+			// Determine micro-subdivision level for this cell:
+			// Flat plains / open deep ocean remain 1 splat for high performance.
+			// Coastlines, hilly mounds, steep relief, and peaks subdivide into a 2x2 or 4x4 sub-grid
+			// so that coastlines and relief conform smoothly to actual contours without jagged stepping.
+			subN := 1
+			if lod <= 1 {
+				if slopeMag > 0.06 || spanH > 0.015 || math.Abs(curv) > 0.4 {
+					subN = 4 // 4x4 = 16 micro-splats for steep relief & peaks
+				} else if slopeMag > 0.015 || hasCoastline || spanH > 0.002 || math.Abs(curv) > 0.15 {
+					subN = 2 // 2x2 = 4 micro-splats for coastlines, gentle mounds & transition borders
+				}
+			}
 
-			sx := float32(0.5 * localSpacing * cfg.OverlapFactor * stretchE)
-			sy := float32(0.5 * localSpacing * cfg.OverlapFactor * stretchN)
-			sz := float32(0.5 * localSpacing * cfg.ThicknessFactor)
+			subDU := (u1 - u0) / float64(subN)
+			subDV := (v1 - v0) / float64(subN)
+			subSpacing := localSpacing / float64(subN)
 
-			// Normal-aligned rotation quaternion
-			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
+			for si := 0; si < subN; si++ {
+				uSub := u0 + (float64(si)+0.5)*subDU
+				for sj := 0; sj < subN; sj++ {
+					vSub := v0 + (float64(sj)+0.5)*subDV
 
-			// Biome color
-			color := tg.computeBiomeColor(latDeg, lonDeg, elevNorm, slopeE, slopeN)
+					sLatDeg, sLonDeg := toLatLon(uSub, vSub)
+					sElevNorm, sSlopeE, sSlopeN, sCurv := tg.sampleElevationAndSlopes(sLatDeg, sLonDeg)
+					sHeight := cfg.BaseElevation + (sElevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 
-			splats = append(splats, splat.Splat{
-				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
-				Scale:    [3]float32{sx, sy, sz},
-				Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
-				Color:    color,
-			})
+					sSlopeMag := math.Hypot(sSlopeE, sSlopeN)
+					sCoplanarity := 1.0 / (1.0 + 1.2*sSlopeMag*sSlopeMag + 0.8*math.Abs(sCurv))
+					minOverlap := math.Max(1.20, cfg.OverlapFactor*0.88)
+					sEffectiveOverlap := minOverlap + (cfg.OverlapFactor-minOverlap)*sCoplanarity
 
-			if elevNorm < cfg.SeaLevel {
-				seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
-				seaPosECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, seaHeight)
-				seaQuat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, 0, 0)
-				seaColor := tg.computeSeaSurfaceColor(latDeg, lonDeg, elevNorm)
-				seaSx := float32(0.5 * localSpacing * cfg.OverlapFactor)
-				seaSy := float32(0.5 * localSpacing * cfg.OverlapFactor)
-				seaSz := float32(0.5 * localSpacing * cfg.ThicknessFactor * 0.5)
+					// On convex summits, tuck height downwards so upper disc surface sits flush
+					if sCurv < -0.5 {
+						tuck := math.Min(-0.35*sCurv/1000.0, 0.25*subSpacing)
+						sHeight -= tuck * cfg.ElevationScale
+					}
 
-				splats = append(splats, splat.Splat{
-					Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
-					Scale:    [3]float32{seaSx, seaSy, seaSz},
-					Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
-					Color:    seaColor,
-				})
+					// Transform to Oblate Spheroid ECEF Cartesian position
+					posECEF := cfg.Spheroid.GeodeticToECEF(sLatDeg, sLonDeg, sHeight)
+
+					sx := float32(0.5 * subSpacing * sEffectiveOverlap)
+					sy := float32(0.5 * subSpacing * sEffectiveOverlap)
+					sz := float32(0.5 * subSpacing * cfg.ThicknessFactor)
+
+					// Normal-aligned rotation quaternion
+					quat := cfg.Spheroid.OrientationQuaternion(sLatDeg, sLonDeg, sSlopeE, sSlopeN)
+
+					// Biome color
+					color := tg.computeBiomeColor(sLatDeg, sLonDeg, sElevNorm, sSlopeE, sSlopeN)
+
+					splats = append(splats, splat.Splat{
+						Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
+						Scale:    [3]float32{sx, sy, sz},
+						Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
+						Color:    color,
+					})
+
+					// Emit sea surface splat for ocean bed AND shoreline transition zone (up to +20m elevation)
+					// to cleanly intersect rising beach land slopes without stepped voids.
+					if sElevNorm < cfg.SeaLevel+0.0025 {
+						seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
+						seaPosECEF := cfg.Spheroid.GeodeticToECEF(sLatDeg, sLonDeg, seaHeight)
+						seaQuat := cfg.Spheroid.OrientationQuaternion(sLatDeg, sLonDeg, 0, 0)
+						seaColor := tg.computeSeaSurfaceColor(sLatDeg, sLonDeg, sElevNorm)
+						seaSx := float32(0.5 * subSpacing * cfg.OverlapFactor)
+						seaSy := float32(0.5 * subSpacing * cfg.OverlapFactor)
+						seaSz := float32(0.5 * subSpacing * cfg.ThicknessFactor * 0.5)
+
+						splats = append(splats, splat.Splat{
+							Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
+							Scale:    [3]float32{seaSx, seaSy, seaSz},
+							Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
+							Color:    seaColor,
+						})
+					}
+				}
 			}
 		}
 	}
@@ -757,15 +795,23 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 	}
 
 	// Leaf cell: Emit single adaptive splat covering this cell
-	elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(latMid, lonMid)
+	elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latMid, lonMid)
 	height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
+
+	slopeMag := math.Hypot(slopeE, slopeN)
+	coplanarity := 1.0 / (1.0 + 1.2*slopeMag*slopeMag + 0.8*math.Abs(curv))
+	minOverlap := math.Max(1.20, cfg.OverlapFactor*0.88)
+	effectiveOverlap := minOverlap + (cfg.OverlapFactor-minOverlap)*coplanarity
+
+	if curv < -0.5 {
+		tuck := math.Min(-0.35*curv/1000.0, 0.25*cellSpacing)
+		height -= tuck * cfg.ElevationScale
+	}
+
 	posECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, height)
 
-	stretchE := math.Sqrt(1.0 + slopeE*slopeE)
-	stretchN := math.Sqrt(1.0 + slopeN*slopeN)
-
-	sx := float32(0.5 * cellSpacing * cfg.OverlapFactor * stretchE)
-	sy := float32(0.5 * cellSpacing * cfg.OverlapFactor * stretchN)
+	sx := float32(0.5 * cellSpacing * effectiveOverlap)
+	sy := float32(0.5 * cellSpacing * effectiveOverlap)
 	sz := float32(0.5 * cellSpacing * cfg.ThicknessFactor)
 
 	quat := cfg.Spheroid.OrientationQuaternion(latMid, lonMid, slopeE, slopeN)
@@ -778,7 +824,7 @@ func (tg *TerrainGenerator) sampleAdaptiveQuad(
 		Color:    color,
 	})
 
-	if elevNorm < cfg.SeaLevel {
+	if elevNorm < cfg.SeaLevel+0.0025 {
 		seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
 		seaPosECEF := cfg.Spheroid.GeodeticToECEF(latMid, lonMid, seaHeight)
 		seaQuat := cfg.Spheroid.OrientationQuaternion(latMid, lonMid, 0, 0)
@@ -837,6 +883,7 @@ func computePatchBounds(splats []splat.Splat, s spheroid.Spheroid, fCenter, fUAx
 }
 
 // WriteContainer generates the full multi-LOD cubed-sphere terrain directly into a compressed indexed container.
+// Chunk generation is parallelized across all available CPU cores with a real-time progress bar.
 func (tg *TerrainGenerator) WriteContainer(filePath string, patchesPerFaceAxis int) error {
 	procCube := tg.NewProceduralCubedSphere(patchesPerFaceAxis)
 	density := tg.EstimatePointDensity(0)
@@ -856,31 +903,114 @@ func (tg *TerrainGenerator) WriteContainer(filePath string, patchesPerFaceAxis i
 		return err
 	}
 
-	for chunkID := 0; chunkID < procCube.TotalChunks; chunkID++ {
-		m := procCube.Manifests[chunkID]
-		cm := splat.ChunkManifest{
-			ChunkID: uint32(m.ID),
-			Center:  m.Center,
-			Radius:  m.Radius,
-			Normal:  m.Normal,
-			LatMin:  -90.0,
-			LatMax:  90.0,
-			LonMin:  -180.0,
-			LonMax:  180.0,
-			LODs:    make([]splat.ChunkLODEntry, 0, 5),
-		}
-
-		for lod := 0; lod < 5; lod++ {
-			splats := procCube.SampleChunkLOD(chunkID, lod)
-			entry, err := cw.WriteChunkLOD(chunkID, uint32(lod), splats)
-			if err != nil {
-				return err
-			}
-			cm.LODs = append(cm.LODs, *entry)
-		}
-
-		cw.AddChunkManifest(cm)
+	type chunkLODData struct {
+		chunkID int
+		lods    [5][]splat.Splat
 	}
 
+	totalChunks := procCube.TotalChunks
+	numWorkers := runtime.GOMAXPROCS(0)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+
+	// Bounded worker pipeline: at most numWorkers*2 chunks in flight simultaneously (~150MB RAM)
+	maxInFlight := numWorkers * 2
+	if maxInFlight < 4 {
+		maxInFlight = 4
+	}
+
+	taskChan := make(chan int, maxInFlight)
+	resultChan := make(chan chunkLODData, maxInFlight)
+
+	go func() {
+		for chunkID := 0; chunkID < totalChunks; chunkID++ {
+			taskChan <- chunkID
+		}
+		close(taskChan)
+	}()
+
+	var wg sync.WaitGroup
+	for w := 0; w < numWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for chunkID := range taskChan {
+				var data chunkLODData
+				data.chunkID = chunkID
+				for lod := 0; lod < 5; lod++ {
+					data.lods[lod] = procCube.SampleChunkLOD(chunkID, lod)
+				}
+				resultChan <- data
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	results := make(map[int]chunkLODData, totalChunks)
+	nextToWrite := 0
+	completed := 0
+	startTime := time.Now()
+
+	renderProgress := func(done, total int) {
+		pct := float64(done) / float64(total) * 100.0
+		barWidth := 28
+		filled := int(float64(barWidth) * float64(done) / float64(total))
+		if filled > barWidth {
+			filled = barWidth
+		}
+		bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+		elapsed := time.Since(startTime).Seconds()
+		var etaSec float64
+		if done > 0 && done < total {
+			etaSec = (elapsed / float64(done)) * float64(total-done)
+		}
+		fmt.Printf("\r[%s] %d/%d chunks (%.1f%%) | %.1fs | ETA %.0fs  ", bar, done, total, pct, elapsed, etaSec)
+	}
+
+	renderProgress(0, totalChunks)
+
+	for data := range resultChan {
+		results[data.chunkID] = data
+		completed++
+		renderProgress(completed, totalChunks)
+
+		for {
+			item, ok := results[nextToWrite]
+			if !ok {
+				break
+			}
+			delete(results, nextToWrite)
+
+			m := procCube.Manifests[item.chunkID]
+			cm := splat.ChunkManifest{
+				ChunkID: uint32(m.ID),
+				Center:  m.Center,
+				Radius:  m.Radius,
+				Normal:  m.Normal,
+				LatMin:  -90.0,
+				LatMax:  90.0,
+				LonMin:  -180.0,
+				LonMax:  180.0,
+				LODs:    make([]splat.ChunkLODEntry, 0, 5),
+			}
+
+			for lod := 0; lod < 5; lod++ {
+				entry, err := cw.WriteChunkLOD(item.chunkID, uint32(lod), item.lods[lod])
+				if err != nil {
+					return err
+				}
+				cm.LODs = append(cm.LODs, *entry)
+			}
+			cw.AddChunkManifest(cm)
+			nextToWrite++
+		}
+	}
+
+	fmt.Println()
 	return cw.Finalize()
 }

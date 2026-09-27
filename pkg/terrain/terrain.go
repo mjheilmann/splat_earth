@@ -54,6 +54,7 @@ type GeneratorConfig struct {
 	RasterPath   string   `json:"rasterPath,omitempty"`   // Path to real-world DEM raster image (e.g. "images/World_elevation_map.png")
 	GEBCOPaths   []string `json:"gebcoPaths,omitempty"`   // Paths to 1km global GEBCO GeoTIFF quadrant tiles (e.g. "images/gebco_08_*.tif")
 	GeoTIFFPaths []string `json:"geotiffPaths,omitempty"` // Paths to high-resolution local GeoTIFF LiDAR DEMs (e.g. "images/USGS_1M_*.tif")
+	Catalog      *ImageCatalog `json:"-"`                 // Surveyed spatial dataset catalog
 
 	BiomeConfigPath string      `json:"biomeConfigPath,omitempty"` // Path to custom JSON biome configuration file (e.g. "config/biomes.json")
 	Biome           BiomeConfig `json:"biome"`                     // Loaded biome hypsometric configuration
@@ -78,9 +79,7 @@ func (cfg *GeneratorConfig) ActiveFocusAreas() []DensityZone {
 
 // DefaultConfig returns parameters for a complete oblate spheroid terrain.
 func DefaultConfig() GeneratorConfig {
-	rasterPath := FindDefaultElevationRaster()
-	gebcoFiles := FindDefaultGEBCOFiles()
-	geoTIFFs := FindDefaultGeoTIFFs()
+	catalog := SurveyImageCatalog("images", ".")
 	biomePath := FindDefaultBiomeConfig()
 
 	biomeCfg := DefaultBiomeConfig()
@@ -90,13 +89,9 @@ func DefaultConfig() GeneratorConfig {
 		}
 	}
 
-	seaLevel := 0.30
-	if rasterPath != "" || len(gebcoFiles) > 0 || len(geoTIFFs) > 0 {
-		if biomeCfg.SeaLevel > 0 {
-			seaLevel = biomeCfg.SeaLevel
-		} else {
-			seaLevel = 143.35 / 255.0 // ~0.56215 true sea level in standard DEM
-		}
+	seaLevel := 143.35 / 255.0 // ~0.56215 true sea level in standard DEM
+	if biomeCfg.SeaLevel > 0 {
+		seaLevel = biomeCfg.SeaLevel
 	}
 
 	focusArea := DensityZone{
@@ -108,20 +103,20 @@ func DefaultConfig() GeneratorConfig {
 		TransitionWidthKm: 0.0,
 	}
 
-	// Auto-configure focus area to match GeoTIFF bounds if LiDAR files are detected
-	if len(geoTIFFs) > 0 {
-		focusArea.CenterLat = 47.581
-		focusArea.CenterLon = -122.335
-		focusArea.AreaSqMiles = 154.0 // ~400 km2 Seattle mosaic
-		focusArea.DensityMultiplier = 64.0
+	// Auto-configure focus area to match King County LiDAR bounds if detected
+	for _, src := range catalog.ElevationSources {
+		info := src.GetInfo()
+		if info.PixelScaleMeters <= 5.0 {
+			focusArea.CenterLat = 0.5 * (info.LatMin + info.LatMax)
+			focusArea.CenterLon = 0.5 * (info.LonMin + info.LonMax)
+			focusArea.AreaSqMiles = 154.0 // ~400 km2 Seattle mosaic
+			focusArea.DensityMultiplier = 64.0
+			break
+		}
 	}
 
-	stepsLat := 150
-	stepsLon := 300
-	if len(gebcoFiles) >= 8 {
-		stepsLat = 21600
-		stepsLon = 43200
-	}
+	stepsLat := 21600
+	stepsLon := 43200
 
 	return GeneratorConfig{
 		Spheroid:           spheroid.NewSpheroid(100.0, spheroid.WGS84Flattening), // Scaled spheroid: radius 100, WGS-84 flattening (0.335%)
@@ -134,14 +129,12 @@ func DefaultConfig() GeneratorConfig {
 		ElevationScale:     1.0, // Realistic elevation scale: 1.0 km visual relief (0.311 km for true 1:1 physical scale)
 		ElevationOffset:    0.0,
 		BaseElevation:      0.0,
-		OverlapFactor:      1.35,
+		OverlapFactor:      1.38,
 		ThicknessFactor:    0.035, // Wafer-thin planar discs (~3.5% of cell width)
 		SeaLevel:           seaLevel,
-		AdaptiveDensity:    false,
-		CurvatureTolerance: 0.12,
-		RasterPath:         rasterPath,
-		GEBCOPaths:         gebcoFiles,
-		GeoTIFFPaths:       geoTIFFs,
+		AdaptiveDensity:    true,
+		CurvatureTolerance: 0.04, // 40m elevation curvature tolerance
+		Catalog:            catalog,
 		BiomeConfigPath:    biomePath,
 		Biome:              biomeCfg,
 		FocusArea:          focusArea,
@@ -152,6 +145,7 @@ func DefaultConfig() GeneratorConfig {
 // TerrainGenerator generates 3D Gaussian Splats over an oblate spheroid.
 type TerrainGenerator struct {
 	config  GeneratorConfig
+	catalog *ImageCatalog
 	raster  *ElevationRaster
 	gebco   *GEBCOMosaic
 	geoTIFF *GeoTIFFMosaic
@@ -215,6 +209,11 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 		cfg.StepsLon = 2
 	}
 
+	catalog := cfg.Catalog
+	if catalog == nil {
+		catalog = SurveyImageCatalog("images", ".")
+	}
+
 	var gebco *GEBCOMosaic
 	gebcoPaths := cfg.GEBCOPaths
 	if len(gebcoPaths) == 0 {
@@ -228,7 +227,7 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 
 	var raster *ElevationRaster
 	rasterPath := cfg.RasterPath
-	if rasterPath == "" && gebco == nil {
+	if rasterPath == "" && gebco == nil && (catalog == nil || len(catalog.ElevationSources) == 0) {
 		rasterPath = FindDefaultElevationRaster()
 	}
 
@@ -275,6 +274,7 @@ func NewTerrainGenerator(cfg GeneratorConfig) *TerrainGenerator {
 
 	return &TerrainGenerator{
 		config:  cfg,
+		catalog: catalog,
 		raster:  raster,
 		gebco:   gebco,
 		geoTIFF: geoTIFF,
@@ -321,7 +321,7 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 				latRad := task.latRad
 
 				if math.Abs(lat) >= 89.99 {
-					elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, 0)
+					elevNorm, slopeE, slopeN, _ := tg.sampleElevationAndSlopes(lat, 0)
 					height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 					posECEF := cfg.Spheroid.GeodeticToECEF(lat, 0, height)
 
@@ -368,20 +368,28 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 						lon -= 360.0
 					}
 
-					elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, lon)
+					elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(lat, lon)
 					height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
-					posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
+
+					slopeMag := math.Hypot(slopeE, slopeN)
+					coplanarity := 1.0 / (1.0 + 1.5*slopeMag*slopeMag + 1.0*math.Abs(curv))
+					effectiveOverlap := 1.0 + (cfg.OverlapFactor-1.0)*coplanarity
+
+					if curv < -0.5 {
+						tuck := math.Min(-0.35*curv/1000.0, 0.25*dEastMeters)
+						height -= tuck * cfg.ElevationScale
+					}
 
 					localDensity := tg.GetDensityMultiplier(lat, lon)
 					scaleFactor := 1.0 / math.Sqrt(localDensity)
-					stretchE := math.Sqrt(1.0 + slopeE*slopeE)
-					stretchN := math.Sqrt(1.0 + slopeN*slopeN)
 
-					sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * scaleFactor * stretchE)
-					sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * scaleFactor * stretchN)
+					posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
+
+					sx := float32(0.5 * dEastMeters * effectiveOverlap * scaleFactor)
+					sy := float32(0.5 * dNorthMeters * effectiveOverlap * scaleFactor)
 					sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor * scaleFactor)
 
-					quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE, slopeN)
+					quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE*0.1, slopeN*0.1)
 					color := tg.computeBiomeColor(lat, lon, elevNorm, slopeE, slopeN)
 
 					rowSplats = append(rowSplats, splat.Splat{
@@ -426,9 +434,56 @@ func (tg *TerrainGenerator) Generate() []splat.Splat {
 	return splats
 }
 
-// sampleElevationAndSlopes samples elevation data and central-difference slope gradients in physical metric units (dh/dx, dh/dy).
-func (tg *TerrainGenerator) sampleElevationAndSlopes(lat, lon float64) (elev, slopeE, slopeN float64) {
-	delta := 0.05 // Small angular delta (in degrees) for sharp alpine slope gradient calculation
+// sampleElevationAndSlopes samples elevation data, slope gradients, and surface curvature in metric units.
+// Uses the finest available surveyed DEM (e.g. 1m LiDAR or 1km GEBCO) with resolution-aware finite differences.
+func (tg *TerrainGenerator) sampleElevationAndSlopes(lat, lon float64) (elev, slopeE, slopeN, curv float64) {
+	if tg.catalog != nil && len(tg.catalog.ElevationSources) > 0 {
+		return tg.catalog.SampleElevationAndSlopes(lat, lon, tg.config.SeaLevel, tg.config.ElevationScale, tg.config.Spheroid.SemiMajorAxis)
+	}
+
+	// 1. High-Resolution 1-meter USGS LiDAR DEM layer
+	if tg.geoTIFF != nil && tg.geoTIFF.Contains(lat, lon) {
+		delta := 0.000020 // ~2.0 meters for sharp urban/topographic grade
+		deltaRad := delta * math.Pi / 180.0
+		a := tg.config.Spheroid.SemiMajorAxis
+		latRad := lat * math.Pi / 180.0
+		cosLat := math.Max(0.01, math.Abs(math.Cos(latRad)))
+
+		hC := tg.sampleHeight(lat, lon)
+		hE := tg.sampleHeight(lat, lon+delta)
+		hW := tg.sampleHeight(lat, lon-delta)
+		hN := tg.sampleHeight(lat+delta, lon)
+		hS := tg.sampleHeight(lat-delta, lon)
+
+		dx := 2.0 * deltaRad * a * cosLat
+		dy := 2.0 * deltaRad * a
+
+		dhE := (hE - hW) * tg.config.ElevationScale
+		dhN := (hN - hS) * tg.config.ElevationScale
+
+		if dx > 0 {
+			slopeE = dhE / dx
+		}
+		if dy > 0 {
+			slopeN = dhN / dy
+		}
+		slopeE = clampFloat(slopeE, -2.5, 2.5)
+		slopeN = clampFloat(slopeN, -2.5, 2.5)
+
+		curv = ((hE + hW - 2.0*hC) + (hN + hS - 2.0*hC)) * 1000.0
+		return hC, slopeE, slopeN, curv
+	}
+
+	// 2. Global GEBCO / DEM layer
+	delta := 0.008333 // ~925m default (1 pixel in 1km GEBCO 43,200x21,600)
+	if tg.gebco == nil && tg.raster != nil {
+		delta = 0.016667 // ~1.85 km for standard 2km Global DEM
+	}
+
+	if m := tg.GetDensityMultiplier(lat, lon); m > 1.05 {
+		delta = math.Max(0.0005, delta/math.Sqrt(m))
+	}
+
 	deltaRad := delta * math.Pi / 180.0
 
 	eCenter := tg.sampleHeight(lat, lon)
@@ -441,23 +496,29 @@ func (tg *TerrainGenerator) sampleElevationAndSlopes(lat, lon float64) (elev, sl
 	latRad := lat * math.Pi / 180.0
 	cosLat := math.Max(0.01, math.Abs(math.Cos(latRad)))
 
-	// Physical horizontal distance in meters/units
 	dx := 2.0 * deltaRad * a * cosLat
 	dy := 2.0 * deltaRad * a
 
-	// Physical vertical elevation change in meters/units
 	dhE := (eEast - eWest) * tg.config.ElevationScale
 	dhN := (eNorth - eSouth) * tg.config.ElevationScale
 
-	slopeE = dhE / dx
-	slopeN = dhN / dy
+	slopeE = clampFloat(dhE/dx, -2.5, 2.5)
+	slopeN = clampFloat(dhN/dy, -2.5, 2.5)
 
-	return eCenter, slopeE, slopeN
+	curv = ((eEast + eWest - 2.0*eCenter) + (eNorth + eSouth - 2.0*eCenter)) * 1000.0
+
+	return eCenter, slopeE, slopeN, curv
 }
 
 // sampleHeight evaluates elevation in [0, 1] from high-resolution GeoTIFF LiDAR DEMs or the global heightmap.
 func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
 	sea := tg.config.SeaLevel
+
+	if tg.catalog != nil && len(tg.catalog.ElevationSources) > 0 {
+		if elev, ok := tg.catalog.SampleElevation(lat, lon, sea); ok {
+			return elev
+		}
+	}
 
 	// 1. High-Resolution GeoTIFF LiDAR DEM layer (e.g. 1-meter USGS King County)
 	if tg.geoTIFF != nil {
@@ -501,11 +562,21 @@ func (tg *TerrainGenerator) sampleHeight(lat, lon float64) float64 {
 
 // computeBiomeColor maps geodetic latitude, longitude, elevation, and slope gradients to satellite-realistic terrain colors.
 func (tg *TerrainGenerator) computeBiomeColor(lat, lon, elev, slopeE, slopeN float64) [4]uint8 {
+	if tg.catalog != nil {
+		if rgb, ok := tg.catalog.SampleImageryColor(lat, lon); ok {
+			return [4]uint8{rgb[0], rgb[1], rgb[2], 255}
+		}
+	}
 	return tg.config.Biome.SampleBiomeColor(tg.config.SeaLevel, lat, lon, elev, slopeE, slopeN)
 }
 
 // computeSeaSurfaceColor maps geodetic latitude, longitude, and bed depth to translucent water colors.
 func (tg *TerrainGenerator) computeSeaSurfaceColor(lat, lon, bedElev float64) [4]uint8 {
+	if tg.catalog != nil {
+		if rgb, ok := tg.catalog.SampleImageryColor(lat, lon); ok {
+			return [4]uint8{rgb[0], rgb[1], rgb[2], 180}
+		}
+	}
 	return tg.config.Biome.SampleSeaSurfaceColor(tg.config.SeaLevel, lat, lon, bedElev)
 }
 

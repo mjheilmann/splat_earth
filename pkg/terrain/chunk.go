@@ -155,7 +155,7 @@ func (tg *TerrainGenerator) generateChunkSplats(footprintScale float64, stride i
 
 		// Handle poles
 		if math.Abs(lat) >= 89.99 {
-			elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, 0)
+			elevNorm, slopeE, slopeN, _ := tg.sampleElevationAndSlopes(lat, 0)
 			height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
 			posECEF := cfg.Spheroid.GeodeticToECEF(lat, 0, height)
 
@@ -200,18 +200,24 @@ func (tg *TerrainGenerator) generateChunkSplats(footprintScale float64, stride i
 			lon := cfg.LonMin + (float64(j)+0.5)*dLonRing
 
 			// Sample procedural elevation
-			elevNorm, slopeE, slopeN := tg.sampleElevationAndSlopes(lat, lon)
+			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(lat, lon)
 			height := cfg.BaseElevation + (elevNorm+cfg.ElevationOffset)*cfg.ElevationScale
+
+			slopeMag := math.Hypot(slopeE, slopeN)
+			coplanarity := 1.0 / (1.0 + 1.5*slopeMag*slopeMag + 1.0*math.Abs(curv))
+			effectiveOverlap := 1.0 + (cfg.OverlapFactor-1.0)*coplanarity
+
+			if curv < -0.5 {
+				tuck := math.Min(-0.35*curv/1000.0, 0.25*dEastMeters)
+				height -= tuck * cfg.ElevationScale
+			}
 
 			// Compute 3D ECEF position
 			posECEF := cfg.Spheroid.GeodeticToECEF(lat, lon, height)
 
-			stretchE := math.Sqrt(1.0 + slopeE*slopeE)
-			stretchN := math.Sqrt(1.0 + slopeN*slopeN)
-
-			// Bloated footprint scale for lower LODs to prevent pinholes
-			sx := float32(0.5 * dEastMeters * cfg.OverlapFactor * footprintScale * stretchE)
-			sy := float32(0.5 * dNorthMeters * cfg.OverlapFactor * footprintScale * stretchN)
+			// Footprint scale for lower LODs to prevent pinholes
+			sx := float32(0.5 * dEastMeters * effectiveOverlap * footprintScale)
+			sy := float32(0.5 * dNorthMeters * effectiveOverlap * footprintScale)
 			sz := float32(0.5 * math.Min(dEastMeters, dNorthMeters) * cfg.ThicknessFactor)
 
 			quat := cfg.Spheroid.OrientationQuaternion(lat, lon, slopeE*0.1, slopeN*0.1)

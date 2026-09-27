@@ -30,7 +30,7 @@ func main() {
 	resLon := flag.Int("res-lon", 0, "Grid resolution along longitude (0 = Auto native source width e.g. 21600)")
 	elevScale := flag.Float64("elev-scale", 1.0, "Max terrain elevation scale in km (1.0 km for subtle relief, 0.311 km for true 1:1 physical scale)")
 	elevOffset := flag.Float64("elev-offset", 0.0, "Baseline elevation offset (-0.5 to +0.5)")
-	overlap := flag.Float64("overlap", 1.35, "Splat size overlap factor for continuous coverage")
+	overlap := flag.Float64("overlap", 1.38, "Splat size overlap factor for continuous coverage")
 	thickness := flag.Float64("thickness", 0.035, "Splat normal thickness factor")
 	defaultBiome := terrain.FindDefaultBiomeConfig()
 	rasterPath := flag.String("raster", defaultRaster, "Path to real-world DEM elevation raster image (e.g. images/World_elevation_map.png)")

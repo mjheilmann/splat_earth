@@ -25,6 +25,62 @@ type GEBCOTile struct {
 	Data   []byte
 }
 
+// Sample samples a raw 8-bit elevation value from the GEBCO tile.
+func (tile *GEBCOTile) Sample(lat, lon float64) (byte, bool) {
+	if val, ok := tile.SampleFloat(lat, lon); ok {
+		return byte(math.Round(val)), true
+	}
+	return 0, false
+}
+
+// SampleFloat samples a continuous elevation value from the GEBCO tile using smooth bilinear interpolation.
+func (tile *GEBCOTile) SampleFloat(lat, lon float64) (float64, bool) {
+	if tile == nil || len(tile.Data) == 0 {
+		return 0, false
+	}
+	if lat < tile.LatMin || lat > tile.LatMax || lon < tile.LonMin || lon > tile.LonMax {
+		return 0, false
+	}
+	u := (lon - tile.LonMin) / (tile.LonMax - tile.LonMin)
+	v := (tile.LatMax - lat) / (tile.LatMax - tile.LatMin)
+
+	x := u * float64(tile.Width-1)
+	y := v * float64(tile.Height-1)
+
+	if x < 0 {
+		x = 0
+	} else if x > float64(tile.Width-1) {
+		x = float64(tile.Width - 1)
+	}
+	if y < 0 {
+		y = 0
+	} else if y > float64(tile.Height-1) {
+		y = float64(tile.Height - 1)
+	}
+
+	x0 := int(math.Floor(x))
+	y0 := int(math.Floor(y))
+	x1 := x0 + 1
+	if x1 >= tile.Width {
+		x1 = tile.Width - 1
+	}
+	y1 := y0 + 1
+	if y1 >= tile.Height {
+		y1 = tile.Height - 1
+	}
+
+	fx := x - float64(x0)
+	fy := y - float64(y0)
+
+	v00 := float64(tile.Data[y0*tile.Width+x0])
+	v10 := float64(tile.Data[y0*tile.Width+x1])
+	v01 := float64(tile.Data[y1*tile.Width+x0])
+	v11 := float64(tile.Data[y1*tile.Width+x1])
+
+	interpolated := (1.0-fx)*(1.0-fy)*v00 + fx*(1.0-fy)*v10 + (1.0-fx)*fy*v01 + fx*fy*v11
+	return interpolated, true
+}
+
 // GEBCOMosaic coordinates the 8 global 1km GEBCO quadrant tiles into a unified 43200x21600 DEM.
 type GEBCOMosaic struct {
 	Tiles       [4][2]*GEBCOTile // [col][row]
@@ -115,7 +171,7 @@ func LoadGEBCOMosaic(filePaths []string) (*GEBCOMosaic, error) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			tile, err := loadSingleGEBCOTile(p, c, r, lMin, lMax, loMin, loMax)
+			tile, err := LoadSingleGEBCOTile(p, c, r, lMin, lMax, loMin, loMax)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -152,7 +208,7 @@ func LoadGEBCOMosaic(filePaths []string) (*GEBCOMosaic, error) {
 	return mosaic, nil
 }
 
-func loadSingleGEBCOTile(path string, col, row int, latMin, latMax, lonMin, lonMax float64) (*GEBCOTile, error) {
+func LoadSingleGEBCOTile(path string, col, row int, latMin, latMax, lonMin, lonMax float64) (*GEBCOTile, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err

@@ -398,6 +398,31 @@ func (m *GeoTIFFMosaic) Intersects(latMin, latMax, lonMin, lonMax float64) bool 
 	return false
 }
 
+// DistanceToKm returns the distance in kilometers from (lat, lon) to the mosaic bounding box.
+func (m *GeoTIFFMosaic) DistanceToKm(lat, lon float64) float64 {
+	if m == nil || len(m.Tiles) == 0 {
+		return 1e9
+	}
+	if lat >= m.LatMin && lat <= m.LatMax && lon >= m.LonMin && lon <= m.LonMax {
+		return 0.0
+	}
+	dLat := 0.0
+	if lat < m.LatMin {
+		dLat = m.LatMin - lat
+	} else if lat > m.LatMax {
+		dLat = lat - m.LatMax
+	}
+	dLon := 0.0
+	if lon < m.LonMin {
+		dLon = m.LonMin - lon
+	} else if lon > m.LonMax {
+		dLon = lon - m.LonMax
+	}
+	dLatKm := dLat * 111.32
+	dLonKm := dLon * 111.32 * math.Cos(lat*math.Pi/180.0)
+	return math.Sqrt(dLatKm*dLatKm + dLonKm*dLonKm)
+}
+
 // MinPixelScaleMeters returns the finest horizontal resolution in meters among all tiles in the mosaic.
 func (m *GeoTIFFMosaic) MinPixelScaleMeters() float64 {
 	if m == nil || len(m.Tiles) == 0 {
@@ -424,8 +449,8 @@ func FindDefaultGeoTIFFs() []string {
 	patterns := []string{
 		"images/USGS_1M_*.tif",
 		"USGS_1M_*.tif",
-		"images/*.tif",
-		"*.tif",
+		"images/*dem*.tif",
+		"*dem*.tif",
 		"../../images/USGS_1M_*.tif",
 	}
 
@@ -436,6 +461,10 @@ func FindDefaultGeoTIFFs() []string {
 			base := strings.ToLower(filepath.Base(m))
 			// Exclude global GEBCO quadrant tiles (managed separately by GEBCOMosaic)
 			if strings.HasPrefix(base, "gebco_") {
+				continue
+			}
+			// Exclude global Blue Marble color imagery tiles
+			if strings.Contains(base, "world.topo.bathy") || strings.Contains(base, "topo.bathy") {
 				continue
 			}
 			if !seen[m] {
