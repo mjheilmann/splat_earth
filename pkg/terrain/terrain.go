@@ -574,7 +574,7 @@ func (tg *TerrainGenerator) computeBiomeColor(lat, lon, elev, slopeE, slopeN flo
 func (tg *TerrainGenerator) computeSeaSurfaceColor(lat, lon, bedElev float64) [4]uint8 {
 	if tg.catalog != nil {
 		if rgb, ok := tg.catalog.SampleImageryColor(lat, lon); ok {
-			return [4]uint8{rgb[0], rgb[1], rgb[2], 180}
+			return [4]uint8{rgb[0], rgb[1], rgb[2], 140}
 		}
 	}
 	return tg.config.Biome.SampleSeaSurfaceColor(tg.config.SeaLevel, lat, lon, bedElev)

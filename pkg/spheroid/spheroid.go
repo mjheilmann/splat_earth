@@ -202,6 +202,15 @@ func (s Spheroid) OrientationQuaternion(latDeg, lonDeg float64, slopeEast, slope
 	)
 }
 
+// BasisQuaternion constructs a rotation quaternion from three orthonormal column basis vectors (X, Y, Z).
+func BasisQuaternion(axisX, axisY, axisZ Vec3) Quat {
+	return matrixToQuaternion(
+		axisX.X, axisY.X, axisZ.X,
+		axisX.Y, axisY.Y, axisZ.Y,
+		axisX.Z, axisY.Z, axisZ.Z,
+	)
+}
+
 func cross(a, b Vec3) Vec3 {
 	return Vec3{
 		X: a.Y*b.Z - a.Z*b.Y,

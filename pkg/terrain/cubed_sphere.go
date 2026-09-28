@@ -469,6 +469,12 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 		return latRad * 180.0 / math.Pi, lonRad * 180.0 / math.Pi
 	}
 
+	toECEFPos := func(u, v, h float64) (spheroid.Vec3, float64, float64) {
+		latDeg, lonDeg := toLatLon(u, v)
+		pos := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, h)
+		return pos, latDeg, lonDeg
+	}
+
 	lat00, lon00 := toLatLon(uMin, vMin)
 	lat10, lon10 := toLatLon(uMax, vMin)
 	lat01, lon01 := toLatLon(uMin, vMax)
@@ -559,17 +565,48 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 			v1 := v0 + float64(stride)*dv
 			vMid := (v0 + v1) * 0.5
 
-			latDeg, lonDeg := toLatLon(uMid, vMid)
-			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latDeg, lonDeg)
+			_, latDeg, lonDeg := toECEFPos(uMid, vMid, 0)
+			pU0, _, _ := toECEFPos(u0, vMid, 0)
+			pU1, _, _ := toECEFPos(u1, vMid, 0)
+			pV0, _, _ := toECEFPos(uMid, v0, 0)
+			pV1, _, _ := toECEFPos(uMid, v1, 0)
 
-			// Gaussian Splat Scale: Tangent footprint matching local density spacing
-			localSpacing := splatSpacing
-			if lod == 0 {
-				localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
-				if localDensity > 1.0 {
-					localSpacing = splatSpacing / math.Sqrt(localDensity)
-				}
+			// True physical metric width along u and height along v on the curved spheroid
+			duX, duY, duZ := pU1.X-pU0.X, pU1.Y-pU0.Y, pU1.Z-pU0.Z
+			dvX, dvY, dvZ := pV1.X-pV0.X, pV1.Y-pV0.Y, pV1.Z-pV0.Z
+			metricDU := math.Sqrt(duX*duX + duY*duY + duZ*duZ)
+			metricDV := math.Sqrt(dvX*dvX + dvY*dvY + dvZ*dvZ)
+			if metricDU < 1e-6 { metricDU = splatSpacing }
+			if metricDV < 1e-6 { metricDV = splatSpacing }
+
+			// Tangent basis aligned directly with (u, v) cubed-sphere grid lines (ensures seamless edge-to-edge chunk tiling)
+			tu := spheroid.Vec3{X: duX / metricDU, Y: duY / metricDU, Z: duZ / metricDU}
+			up := cfg.Spheroid.SurfaceNormal(latDeg, lonDeg)
+			tv := spheroid.Vec3{
+				X: up.Y*tu.Z - up.Z*tu.Y,
+				Y: up.Z*tu.X - up.X*tu.Z,
+				Z: up.X*tu.Y - up.Y*tu.X,
 			}
+			lenTv := math.Sqrt(tv.X*tv.X + tv.Y*tv.Y + tv.Z*tv.Z)
+			if lenTv > 1e-9 {
+				tv.X /= lenTv; tv.Y /= lenTv; tv.Z /= lenTv
+			} else {
+				tv = spheroid.Vec3{X: dvX / metricDV, Y: dvY / metricDV, Z: dvZ / metricDV}
+			}
+			tu = spheroid.Vec3{
+				X: tv.Y*up.Z - tv.Z*up.Y,
+				Y: tv.Z*up.X - tv.X*up.Z,
+				Z: tv.X*up.Y - tv.Y*up.X,
+			}
+			lenTu := math.Sqrt(tu.X*tu.X + tu.Y*tu.Y + tu.Z*tu.Z)
+			if lenTu > 1e-9 {
+				tu.X /= lenTu; tu.Y /= lenTu; tu.Z /= lenTu
+			}
+
+			// Grid-aligned sea level orientation quaternion
+			seaQuat := spheroid.BasisQuaternion(tu, tv, up)
+
+			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latDeg, lonDeg)
 
 			height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
 
@@ -580,19 +617,47 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 
 			// On convex summits, tuck height downwards so upper disc surface sits flush
 			if curv < -0.5 {
-				tuck := math.Min(-0.35*curv/1000.0, 0.25*localSpacing)
+				tuck := math.Min(-0.35*curv/1000.0, 0.25*math.Min(metricDU, metricDV))
 				height -= tuck * cfg.ElevationScale
 			}
 
 			// Transform to Oblate Spheroid ECEF Cartesian position
 			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
 
-			sx := float32(0.5 * localSpacing * effectiveOverlap)
-			sy := float32(0.5 * localSpacing * effectiveOverlap)
-			sz := float32(0.5 * localSpacing * cfg.ThicknessFactor)
+			sx := float32(0.5 * metricDU * effectiveOverlap)
+			sy := float32(0.5 * metricDV * effectiveOverlap)
+			sz := float32(0.5 * math.Min(metricDU, metricDV) * cfg.ThicknessFactor)
 
-			// Normal-aligned rotation quaternion
-			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
+			// Normal-aligned rotation quaternion for terrestrial terrain (projected along grid axes)
+			landTu, landTv, landUp := tu, tv, up
+			if slopeE != 0 || slopeN != 0 {
+				east, north, _ := cfg.Spheroid.TangentBasis(latDeg, lonDeg)
+				terrainNorm := spheroid.Vec3{
+					X: up.X - slopeE*east.X - slopeN*north.X,
+					Y: up.Y - slopeE*east.Y - slopeN*north.Y,
+					Z: up.Z - slopeE*east.Z - slopeN*north.Z,
+				}
+				lenTN := math.Sqrt(terrainNorm.X*terrainNorm.X + terrainNorm.Y*terrainNorm.Y + terrainNorm.Z*terrainNorm.Z)
+				if lenTN > 1e-9 {
+					landUp = spheroid.Vec3{X: terrainNorm.X / lenTN, Y: terrainNorm.Y / lenTN, Z: terrainNorm.Z / lenTN}
+					dotU := tu.X*landUp.X + tu.Y*landUp.Y + tu.Z*landUp.Z
+					projU := spheroid.Vec3{X: tu.X - dotU*landUp.X, Y: tu.Y - dotU*landUp.Y, Z: tu.Z - dotU*landUp.Z}
+					lenPU := math.Sqrt(projU.X*projU.X + projU.Y*projU.Y + projU.Z*projU.Z)
+					if lenPU > 1e-9 {
+						landTu = spheroid.Vec3{X: projU.X / lenPU, Y: projU.Y / lenPU, Z: projU.Z / lenPU}
+					}
+					landTv = spheroid.Vec3{
+						X: landUp.Y*landTu.Z - landUp.Z*landTu.Y,
+						Y: landUp.Z*landTu.X - landUp.X*landTu.Z,
+						Z: landUp.X*landTu.Y - landUp.Y*landTu.X,
+					}
+					lenTV := math.Sqrt(landTv.X*landTv.X + landTv.Y*landTv.Y + landTv.Z*landTv.Z)
+					if lenTV > 1e-9 {
+						landTv.X /= lenTV; landTv.Y /= lenTV; landTv.Z /= lenTV
+					}
+				}
+			}
+			quat := spheroid.BasisQuaternion(landTu, landTv, landUp)
 
 			// Biome color
 			color := tg.computeBiomeColor(latDeg, lonDeg, elevNorm, slopeE, slopeN)
@@ -609,11 +674,10 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 			if elevNorm < cfg.SeaLevel+0.0025 {
 				seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
 				seaPosECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, seaHeight)
-				seaQuat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, 0, 0)
 				seaColor := tg.computeSeaSurfaceColor(latDeg, lonDeg, elevNorm)
-				seaSx := float32(0.5 * localSpacing * cfg.OverlapFactor)
-				seaSy := float32(0.5 * localSpacing * cfg.OverlapFactor)
-				seaSz := float32(0.5 * localSpacing * cfg.ThicknessFactor * 0.5)
+				seaSx := float32(0.5 * metricDU * cfg.OverlapFactor)
+				seaSy := float32(0.5 * metricDV * cfg.OverlapFactor)
+				seaSz := float32(0.5 * math.Min(metricDU, metricDV) * cfg.ThicknessFactor * 0.5)
 
 				splats = append(splats, splat.Splat{
 					Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},

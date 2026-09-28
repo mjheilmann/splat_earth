@@ -208,13 +208,14 @@
     uniform float u_sunIntensity;
     uniform float u_ambientIntensity;
     uniform float u_hazeDensity;
+    uniform float u_spheroidRadius;
     uniform bool u_shadingEnabled;
     uniform bool u_showSeaSurface;
     uniform float u_waterOpacity;
     uniform float u_alphaBoost;
     uniform int u_colorMode;
     uniform int u_kernelType;
-    uniform float u_spheroidRadius;
+    uniform int u_renderPass; // 1 = Opaque Terrain/Seabed, 2 = Translucent Sea Surface, 0 = All
 
     out vec4 fragColor;
 
@@ -231,18 +232,26 @@
     }
 
     void main() {
-        bool isWater = (v_color.a <= 0.68);
-        if (isWater && !u_showSeaSurface) {
-            discard;
+        bool isWater = (v_color.a <= 0.85);
+
+        if (u_renderPass == 1) {
+            // Pass 1: Opaque Land & Seabed Bathymetry (Depth Write ON)
+            if (isWater) discard;
+        } else if (u_renderPass == 2) {
+            // Pass 2: Translucent Ocean Sea Surface (Depth Write OFF)
+            if (!isWater || !u_showSeaSurface) discard;
+        } else {
+            if (isWater && !u_showSeaSurface) discard;
         }
 
         float alpha = 1.0;
 
         if (isWater) {
-            // Seamless airtight square surfel tiling for water surface (no gaps between adjacent tiles)
-            if (max(abs(v_uv.x), abs(v_uv.y)) > 1.0) discard;
-            float baseWaterAlpha = (v_color.a / 0.60);
-            alpha = clamp(baseWaterAlpha * u_waterOpacity * u_alphaBoost * 0.60, 0.02, 1.0);
+            // Smooth edge feathering for translucent water surfels (eliminates dark overlap seams & chunk boundary lines)
+            float edgeDist = max(abs(v_uv.x), abs(v_uv.y));
+            if (edgeDist > 1.0) discard;
+            float edgeFade = smoothstep(1.0, 0.70, edgeDist);
+            alpha = clamp(v_color.a * u_waterOpacity * u_alphaBoost * edgeFade, 0.02, 1.0);
         } else if (u_kernelType == 0) {
             // Seamless Square Surfel: 100% airtight quadrilateral tiling for Cartesian DEM/LiDAR grids
             if (max(abs(v_uv.x), abs(v_uv.y)) > 1.0) discard;
@@ -286,16 +295,16 @@
         }
 
         if (isWater) {
-            // Oceanic subtle wave ripples
-            float wave1 = sin(v_uv.x * 12.56 + v_worldPos.x * 8.0) * cos(v_uv.y * 12.56 + v_worldPos.y * 8.0);
-            float wave2 = sin(v_uv.x * 25.12 - v_uv.y * 18.84) * 0.5;
-            float wave = (wave1 + wave2) * 0.05;
+            // Oceanic subtle wave ripples based on continuous 3D world coordinates (seamless across chunks & LODs)
+            float wave1 = sin(v_worldPos.x * 24.0 + v_worldPos.y * 24.0) * cos(v_worldPos.z * 24.0);
+            float wave2 = sin(v_worldPos.x * 48.0 - v_worldPos.z * 36.0) * 0.5;
+            float wave = (wave1 + wave2) * 0.04;
             baseColor = clamp(baseColor * (1.0 + wave), 0.0, 1.0);
         } else {
-            // High-Frequency Micro-Relief Noise inside Terrain Splats
-            float grain1 = sin(v_uv.x * 9.42 + v_uv.y * 6.28) * cos(v_uv.x * 6.28 - v_uv.y * 12.56);
-            float grain2 = sin(v_uv.x * 18.84 - v_uv.y * 15.70) * 0.5;
-            float microRelief = (grain1 + grain2) * 0.065;
+            // High-Frequency Micro-Relief Noise inside Terrain Splats (continuous world coordinates)
+            float grain1 = sin(v_worldPos.x * 120.0 + v_worldPos.y * 80.0) * cos(v_worldPos.x * 80.0 - v_worldPos.z * 160.0);
+            float grain2 = sin(v_worldPos.x * 240.0 - v_worldPos.z * 200.0) * 0.5;
+            float microRelief = (grain1 + grain2) * 0.055;
             baseColor = clamp(baseColor * (1.0 + microRelief), 0.0, 1.0);
         }
 
@@ -341,18 +350,113 @@
         // --- Atmospheric Rayleigh Scattering & Aerial Perspective ---
         if (u_hazeDensity > 0.001) {
             float distToCam = length(u_camPos - v_worldPos);
-            float hazeFactor = 1.0 - exp(-distToCam * 0.0016 * u_hazeDensity);
-            hazeFactor = clamp(hazeFactor, 0.0, 0.85);
 
-            // Sun forward-scattering glow in horizon haze
+            // Barometric air density: air is densest in the lower troposphere (scale height ~4.0 km)
+            float camAlt = length(u_camPos) - u_spheroidRadius;
+            float surfAlt = length(v_worldPos) - u_spheroidRadius;
+            float avgAlt = max(0.0, (camAlt + surfAlt) * 0.5);
+            float airDensity = exp(-avgAlt / 4.0);
+
+            // Ground/Aerial perspective: rich atmospheric depth over distant low-elevation horizons (10km-40km)
+            // Orbital perspective: soft planetary limb atmosphere across high-altitude space view
+            float groundHaze = 1.0 - exp(-distToCam * 0.045 * airDensity * u_hazeDensity);
+            float orbitHaze  = 1.0 - exp(-distToCam * 0.0025 * u_hazeDensity);
+            float hazeFactor = clamp(max(groundHaze, orbitHaze), 0.0, 0.90);
+
+            // Sun forward-scattering glow in horizon haze (Mie forward golden beam + cool ambient sky)
             float VdotL = max(0.0, dot(-V, L));
-            vec3 hazeColor = mix(vec3(0.40, 0.56, 0.76), vec3(1.0, 0.82, 0.55), pow(VdotL, 4.0) * 0.65);
+            vec3 hazeColor = mix(vec3(0.50, 0.65, 0.82), vec3(1.0, 0.84, 0.58), pow(VdotL, 4.0) * 0.65);
 
             litColor = mix(litColor, hazeColor, hazeFactor);
         }
 
         // Premultiplied alpha blending
         fragColor = vec4(litColor * alpha, alpha);
+    }
+    `;
+
+    // Atmospheric Sky Dome & Planetary Orbital Limb Shaders
+    const skyVS = `#version 300 es
+    precision highp float;
+    layout(location = 0) in vec2 a_pos;
+    out vec2 v_ndc;
+    void main() {
+        v_ndc = a_pos;
+        gl_Position = vec4(a_pos, 0.9999, 1.0);
+    }
+    `;
+
+    const skyFS = `#version 300 es
+    precision highp float;
+    in vec2 v_ndc;
+    uniform vec3 u_camPos;
+    uniform vec3 u_camForward;
+    uniform vec3 u_camRight;
+    uniform vec3 u_camUp;
+    uniform float u_tanFovX;
+    uniform float u_tanFovY;
+    uniform vec3 u_sunDir;
+    uniform float u_spheroidRadius;
+    uniform float u_hazeDensity;
+    uniform float u_sunIntensity;
+    out vec4 fragColor;
+
+    void main() {
+        vec3 rayDir = normalize(u_camForward + v_ndc.x * u_camRight * u_tanFovX + v_ndc.y * u_camUp * u_tanFovY);
+        float camDist = length(u_camPos);
+        vec3 camUpNorm = normalize(u_camPos);
+        float R_surf = u_spheroidRadius;
+        float R_atm = R_surf * 1.045; // Atmosphere shell (~4.5km height on 100km sphere)
+        float camAlt = max(0.0001, camDist - R_surf);
+
+        // Deep Space Background Color (Deep void space navy)
+        vec3 spaceColor = vec3(0.012, 0.018, 0.030);
+
+        // Sun disc in space / sky
+        float sunDot = dot(rayDir, u_sunDir);
+        float sunDisc = pow(max(0.0, sunDot), 1024.0) * 8.0;
+        float sunGlare = pow(max(0.0, sunDot), 32.0) * 0.45;
+        vec3 sunColor = vec3(1.0, 0.96, 0.85) * (sunDisc + sunGlare) * u_sunIntensity;
+
+        // Day/Night Solar Angle at Camera Location
+        float sunAltAtCam = dot(camUpNorm, u_sunDir);
+        float dayFactor = clamp((sunAltAtCam + 0.12) / 0.30, 0.0, 1.0);
+        float sunsetFactor = clamp(1.0 - abs(sunAltAtCam) * 4.0, 0.0, 1.0);
+
+        // --- 1. Low-Elevation Daytime Sky Dome (Inside Atmosphere) ---
+        float cosZenith = dot(rayDir, camUpNorm);
+        float horizonElev = max(0.0, cosZenith);
+
+        // Rayleigh blue zenith gradient fading to horizon cyan/warm sunset
+        vec3 zenithColor = mix(vec3(0.08, 0.28, 0.68), vec3(0.15, 0.42, 0.88), dayFactor);
+        vec3 horizonCyan = mix(vec3(0.48, 0.68, 0.88), vec3(0.95, 0.62, 0.35), sunsetFactor);
+        vec3 skyDomeColor = mix(horizonCyan, zenithColor, pow(horizonElev, 0.45));
+        skyDomeColor += sunColor * (0.8 * dayFactor);
+
+        // Sky dome opacity decays as camera ascends out of troposphere into orbit (5km -> 30km)
+        float groundSkyWeight = clamp(1.0 - (camAlt - 3.0) / 25.0, 0.0, 1.0) * dayFactor * clamp(u_hazeDensity * 1.6, 0.05, 1.5);
+
+        // --- 2. Orbital Planetary Limb Atmospheric Halo ---
+        float tClosest = -dot(u_camPos, rayDir);
+        vec3 closestPt = u_camPos + rayDir * max(0.0, tClosest);
+        float dClosest = length(closestPt);
+        float limbAlt = dClosest - R_surf;
+
+        vec3 limbColor = vec3(0.0);
+        if (dClosest > R_surf && dClosest < R_atm && tClosest > 0.0) {
+            float limbThickness = exp(-limbAlt / 1.1);
+            vec3 ptNorm = normalize(closestPt);
+            float sunlit = clamp(dot(ptNorm, u_sunDir) * 1.8 + 0.2, 0.0, 1.0);
+            float forwardScatter = pow(max(0.0, sunDot), 6.0);
+            vec3 limbBase = mix(vec3(0.25, 0.58, 0.98), vec3(1.0, 0.85, 0.55), forwardScatter * 0.7);
+            limbColor = limbBase * limbThickness * sunlit * u_hazeDensity * 2.2;
+        }
+
+        // Combine Sky Dome, Planetary Limb Halo, and Space
+        vec3 finalSky = mix(spaceColor + sunColor, skyDomeColor, groundSkyWeight);
+        finalSky += limbColor * (1.0 - groundSkyWeight * 0.7);
+
+        fragColor = vec4(finalSky, 1.0);
     }
     `;
 
@@ -376,9 +480,9 @@
     `;
 
     // WebGL Pipeline Objects
-    let splatProgram, gridProgram;
+    let splatProgram, gridProgram, skyProgram;
     let quadVBO, splatCentersVBO, splatScalesVBO, splatRotationsVBO, splatColorsVBO;
-    let splatVAO, gridVAO, gridVBO, gridLineCount = 0;
+    let splatVAO, gridVAO, skyVAO, gridVBO, gridLineCount = 0;
 
     function createShader(gl, type, source) {
         const shader = gl.createShader(type);
@@ -395,6 +499,10 @@
     function createProgram(gl, vsSource, fsSource) {
         const vs = createShader(gl, gl.VERTEX_SHADER, vsSource);
         const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSource);
+        if (!vs || !fs) {
+            console.error('Failed to compile shaders for program');
+            return null;
+        }
         const prog = gl.createProgram();
         gl.attachShader(prog, vs);
         gl.attachShader(prog, fs);
@@ -596,6 +704,7 @@
     function initGL() {
         splatProgram = createProgram(gl, splatVS, splatFS);
         gridProgram = createProgram(gl, gridVS, gridFS);
+        skyProgram = createProgram(gl, skyVS, skyFS);
 
         const quadData = new Float32Array([
             -2.0, -2.0,
@@ -606,20 +715,22 @@
              2.0,  2.0
         ]);
 
-        splatVAO = gl.createVertexArray();
-        gl.bindVertexArray(splatVAO);
-
         quadVBO = gl.createBuffer();
         gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
         gl.bufferData(gl.ARRAY_BUFFER, quadData, gl.STATIC_DRAW);
-        gl.enableVertexAttribArray(0);
-        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
-        // Dynamic Instanced Buffers for Visible Splats
         splatCentersVBO = gl.createBuffer();
         splatScalesVBO = gl.createBuffer();
         splatRotationsVBO = gl.createBuffer();
         splatColorsVBO = gl.createBuffer();
+
+        // Configure splatVAO with quad geometry and instanced attribute streams
+        splatVAO = gl.createVertexArray();
+        gl.bindVertexArray(splatVAO);
+
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
 
         gl.bindBuffer(gl.ARRAY_BUFFER, splatCentersVBO);
         gl.enableVertexAttribArray(1);
@@ -641,6 +752,14 @@
         gl.vertexAttribPointer(4, 4, gl.UNSIGNED_BYTE, true, 0, 0);
         gl.vertexAttribDivisor(4, 1);
 
+        gl.bindVertexArray(null);
+
+        // Sky VAO using same quadVBO
+        skyVAO = gl.createVertexArray();
+        gl.bindVertexArray(skyVAO);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadVBO);
+        gl.enableVertexAttribArray(0);
+        gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
         gl.bindVertexArray(null);
 
         initSpheroidGrid();
@@ -968,11 +1087,10 @@
             const proj = Mat4.perspective(state.camera.fov, aspect, near, far);
             const view = state.cameraMode === 'fly' ? Quat.toViewMatrix(state.camera.pos, state.camera.quat) : Mat4.lookAt(state.camera.pos, state.camera.target, [0, 0, 1]);
             await updateChunkCullingAndLOD(view, proj, aspect, near, far);
-
-            hideLoader();
         } catch (err) {
             console.error('Error fetching splats:', err);
-            showLoader('Error loading splats: ' + err.message);
+        } finally {
+            hideLoader();
         }
     }
 
@@ -1256,20 +1374,20 @@
                 const metricDist = Math.max(0.0, (surfaceDist / refRadius) / (bias * gazeBonus));
 
                 let targetLOD = 0;
-                if (metricDist <= 0.35) {
-                    // Ground / Immediate Focus: Full Resolution (LOD 0)
+                if (metricDist <= 0.95) {
+                    // Ground / Immediate Region: Full Resolution (LOD 0)
                     targetLOD = 0;
-                } else if (metricDist <= 1.2) {
-                    // Immediate Neighbors: High Resolution (LOD 1, 4x reduction)
+                } else if (metricDist <= 2.2) {
+                    // Surrounding Neighborhood: High Resolution (LOD 1)
                     targetLOD = 1;
-                } else if (metricDist <= 3.5) {
-                    // Mid-Range Terrain: Medium Resolution (LOD 2, 16x reduction)
+                } else if (metricDist <= 5.5) {
+                    // Mid-Range Horizon: Medium Resolution (LOD 2)
                     targetLOD = 2;
-                } else if (metricDist <= 8.5) {
-                    // Far Horizon: Coarse Resolution (LOD 3, 64x reduction)
+                } else if (metricDist <= 11.0) {
+                    // Far Horizon / Curvature: Coarse Resolution (LOD 3)
                     targetLOD = 3;
                 } else {
-                    // Planetary Orbit: Deep Orbit (LOD 4, 256x reduction)
+                    // Planetary Orbit: Global Orbit (LOD 4)
                     targetLOD = 4;
                 }
 
@@ -1338,7 +1456,7 @@
 
                 // Check signature to avoid redundant GPU VBO re-allocations when scene is static
                 const sig = loadedEntries.map(e => `${e.id}:${e.lod}`).join(',');
-                if (sig !== state.lastBufferSig || hasOngoingFade) {
+                if (sig !== state.lastBufferSig || state.hasActiveLODFade) {
                     state.lastBufferSig = sig;
 
                     if (totalActive > 0) {
@@ -1689,7 +1807,7 @@
 
         updateCamera(dt);
 
-        gl.clearColor(0.02, 0.04, 0.07, 1.0);
+        gl.clearColor(0.012, 0.018, 0.030, 1.0);
         gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
         const aspect = canvas.width / canvas.height;
@@ -1711,6 +1829,45 @@
             view = Mat4.lookAt(state.camera.pos, state.camera.target, [0, 0, 1]);
         }
         const mvp = Mat4.multiply(proj, view);
+
+        // Sun Lighting & Direction Vectors
+        const azRad = (state.sunAzimuth || 45.0) * Math.PI / 180.0;
+        const elRad = (state.sunElevation || 35.0) * Math.PI / 180.0;
+        const sunDirX = Math.cos(elRad) * Math.cos(azRad);
+        const sunDirY = Math.cos(elRad) * Math.sin(azRad);
+        const sunDirZ = Math.sin(elRad);
+
+        // 1. Render Atmospheric Sky Dome & Planetary Horizon Limb Pass
+        if (skyProgram && skyVAO) {
+            gl.useProgram(skyProgram);
+            gl.bindVertexArray(skyVAO);
+            gl.disable(gl.DEPTH_TEST);
+            gl.depthMask(false);
+
+            const tanFovY = Math.tan(state.camera.fov * 0.5);
+            const tanFovX = tanFovY * aspect;
+            let normFwd = (state.cameraMode === 'fly')
+                ? [ -view[2], -view[6], -view[10] ]
+                : [ state.camera.target[0] - state.camera.pos[0], state.camera.target[1] - state.camera.pos[1], state.camera.target[2] - state.camera.pos[2] ];
+            const fLen = Math.hypot(normFwd[0], normFwd[1], normFwd[2]) || 1.0;
+            normFwd[0] /= fLen; normFwd[1] /= fLen; normFwd[2] /= fLen;
+            const normRight = [ view[0], view[4], view[8] ];
+            const normUp = [ view[1], view[5], view[9] ];
+
+            gl.uniform3f(gl.getUniformLocation(skyProgram, 'u_camPos'), state.camera.pos[0], state.camera.pos[1], state.camera.pos[2]);
+            gl.uniform3f(gl.getUniformLocation(skyProgram, 'u_camForward'), normFwd[0], normFwd[1], normFwd[2]);
+            gl.uniform3f(gl.getUniformLocation(skyProgram, 'u_camRight'), normRight[0], normRight[1], normRight[2]);
+            gl.uniform3f(gl.getUniformLocation(skyProgram, 'u_camUp'), normUp[0], normUp[1], normUp[2]);
+            gl.uniform1f(gl.getUniformLocation(skyProgram, 'u_tanFovX'), tanFovX);
+            gl.uniform1f(gl.getUniformLocation(skyProgram, 'u_tanFovY'), tanFovY);
+            gl.uniform3f(gl.getUniformLocation(skyProgram, 'u_sunDir'), sunDirX, sunDirY, sunDirZ);
+            gl.uniform1f(gl.getUniformLocation(skyProgram, 'u_spheroidRadius'), state.spheroid.radius);
+            gl.uniform1f(gl.getUniformLocation(skyProgram, 'u_hazeDensity'), state.hazeDensity !== undefined ? state.hazeDensity : 0.50);
+            gl.uniform1f(gl.getUniformLocation(skyProgram, 'u_sunIntensity'), state.sunIntensity !== undefined ? state.sunIntensity : 1.25);
+
+            gl.drawArrays(gl.TRIANGLES, 0, 6);
+            gl.bindVertexArray(null);
+        }
 
         // Periodic Chunk Culling & Continuous LOD Crossfade update
         if (state.hasActiveLODFade || time - state.lastLODUpdate > 100) {
@@ -1740,33 +1897,39 @@
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_kernelType'), state.kernelType || 0);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_spheroidRadius'), state.spheroid.radius);
 
-            // Sun Lighting & Atmosphere Uniforms
-            const azRad = (state.sunAzimuth || 45.0) * Math.PI / 180.0;
-            const elRad = (state.sunElevation || 35.0) * Math.PI / 180.0;
-            const sunDirX = Math.cos(elRad) * Math.cos(azRad);
-            const sunDirY = Math.cos(elRad) * Math.sin(azRad);
-            const sunDirZ = Math.sin(elRad);
-
             gl.uniform3f(gl.getUniformLocation(splatProgram, 'u_sunDir'), sunDirX, sunDirY, sunDirZ);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_sunIntensity'), state.sunIntensity || 1.25);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_ambientIntensity'), state.ambientIntensity || 0.38);
             gl.uniform1f(gl.getUniformLocation(splatProgram, 'u_hazeDensity'), state.hazeDensity || 0.50);
             gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_shadingEnabled'), state.shadingEnabled ? 1 : 0);
 
+            gl.enable(gl.BLEND);
+            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+            gl.bindVertexArray(splatVAO);
+
             if (state.depthTest) {
                 gl.enable(gl.DEPTH_TEST);
                 gl.depthFunc(gl.LEQUAL);
+
+                // Pass 1: Opaque Solid Terrain & Seabed Bathymetry (Depth Write ON)
                 gl.depthMask(true);
+                gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_renderPass'), 1);
+                gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, drawCount);
+
+                // Pass 2: Translucent Ocean Sea Surface (Depth Write OFF - never occludes submerged seabed)
+                if (state.showSeaSurface) {
+                    gl.depthMask(false);
+                    gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_renderPass'), 2);
+                    gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, drawCount);
+                    gl.depthMask(true);
+                }
             } else {
                 gl.disable(gl.DEPTH_TEST);
                 gl.depthMask(false);
+                gl.uniform1i(gl.getUniformLocation(splatProgram, 'u_renderPass'), 0);
+                gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, drawCount);
             }
 
-            gl.enable(gl.BLEND);
-            gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-            gl.bindVertexArray(splatVAO);
-            gl.drawArraysInstanced(gl.TRIANGLES, 0, 6, drawCount);
             gl.bindVertexArray(null);
         }
 
@@ -1917,13 +2080,6 @@
         if (btnFrame) {
             btnFrame.addEventListener('click', () => {
                 framePlanet();
-            });
-        }
-
-        const btnFrameFocus = document.getElementById('btn-frame-focus');
-        if (btnFrameFocus) {
-            btnFrameFocus.addEventListener('click', () => {
-                frameFocusZone();
             });
         }
 
@@ -2131,9 +2287,14 @@
         loader.classList.add('hidden');
     }
 
-    initGL();
-    setupUI();
-    fetchSplatData();
-    requestAnimationFrame(render);
+    try {
+        initGL();
+        setupUI();
+        fetchSplatData();
+        requestAnimationFrame(render);
+    } catch (err) {
+        console.error('Viewer startup initialization error:', err);
+        hideLoader();
+    }
 
 })();
