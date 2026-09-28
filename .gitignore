@@ -1,6 +1,6 @@
 # Compiled Go Binaries & Build Artifacts
-generate
-viewer
+/generate
+/viewer
 cmd/generate/generate
 cmd/viewer/viewer
 *.exe

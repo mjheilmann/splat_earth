@@ -559,111 +559,68 @@ func (tg *TerrainGenerator) sampleCubedSpherePatch(
 			v1 := v0 + float64(stride)*dv
 			vMid := (v0 + v1) * 0.5
 
-			latMid, lonMid := toLatLon(uMid, vMid)
-			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latMid, lonMid)
-			slopeMag := math.Hypot(slopeE, slopeN)
-
-			// Sample cell corners to detect local elevation span / relief within this cell
-			lat00, lon00 := toLatLon(u0, v0)
-			lat10, lon10 := toLatLon(u1, v0)
-			lat01, lon01 := toLatLon(u0, v1)
-			lat11, lon11 := toLatLon(u1, v1)
-
-			h00 := tg.sampleHeight(lat00, lon00)
-			h10 := tg.sampleHeight(lat10, lon10)
-			h01 := tg.sampleHeight(lat01, lon01)
-			h11 := tg.sampleHeight(lat11, lon11)
-
-			spanH := math.Max(math.Abs(h00-h11), math.Abs(h10-h01)) * cfg.ElevationScale
-			hasCoastline := (elevNorm >= cfg.SeaLevel && (h00 < cfg.SeaLevel || h10 < cfg.SeaLevel || h01 < cfg.SeaLevel || h11 < cfg.SeaLevel)) ||
-				(elevNorm < cfg.SeaLevel && (h00 >= cfg.SeaLevel || h10 >= cfg.SeaLevel || h01 >= cfg.SeaLevel || h11 >= cfg.SeaLevel)) ||
-				math.Abs(elevNorm-cfg.SeaLevel) < 0.005
+			latDeg, lonDeg := toLatLon(uMid, vMid)
+			elevNorm, slopeE, slopeN, curv := tg.sampleElevationAndSlopes(latDeg, lonDeg)
 
 			// Gaussian Splat Scale: Tangent footprint matching local density spacing
 			localSpacing := splatSpacing
 			if lod == 0 {
-				localDensity := tg.GetDensityMultiplier(latMid, lonMid)
+				localDensity := tg.GetDensityMultiplier(latDeg, lonDeg)
 				if localDensity > 1.0 {
 					localSpacing = splatSpacing / math.Sqrt(localDensity)
 				}
 			}
 
-			// Determine micro-subdivision level for this cell:
-			// Flat plains / open deep ocean remain 1 splat for high performance.
-			// Coastlines, hilly mounds, steep relief, and peaks subdivide into a 2x2 or 4x4 sub-grid
-			// so that coastlines and relief conform smoothly to actual contours without jagged stepping.
-			subN := 1
-			if lod <= 1 {
-				if slopeMag > 0.06 || spanH > 0.015 || math.Abs(curv) > 0.4 {
-					subN = 4 // 4x4 = 16 micro-splats for steep relief & peaks
-				} else if slopeMag > 0.015 || hasCoastline || spanH > 0.002 || math.Abs(curv) > 0.15 {
-					subN = 2 // 2x2 = 4 micro-splats for coastlines, gentle mounds & transition borders
-				}
+			height := cfg.BaseElevation + (elevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
+
+			slopeMag := math.Hypot(slopeE, slopeN)
+			coplanarity := 1.0 / (1.0 + 1.2*slopeMag*slopeMag + 0.8*math.Abs(curv))
+			minOverlap := math.Max(1.20, cfg.OverlapFactor*0.88)
+			effectiveOverlap := minOverlap + (cfg.OverlapFactor-minOverlap)*coplanarity
+
+			// On convex summits, tuck height downwards so upper disc surface sits flush
+			if curv < -0.5 {
+				tuck := math.Min(-0.35*curv/1000.0, 0.25*localSpacing)
+				height -= tuck * cfg.ElevationScale
 			}
 
-			subDU := (u1 - u0) / float64(subN)
-			subDV := (v1 - v0) / float64(subN)
-			subSpacing := localSpacing / float64(subN)
+			// Transform to Oblate Spheroid ECEF Cartesian position
+			posECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, height)
 
-			for si := 0; si < subN; si++ {
-				uSub := u0 + (float64(si)+0.5)*subDU
-				for sj := 0; sj < subN; sj++ {
-					vSub := v0 + (float64(sj)+0.5)*subDV
+			sx := float32(0.5 * localSpacing * effectiveOverlap)
+			sy := float32(0.5 * localSpacing * effectiveOverlap)
+			sz := float32(0.5 * localSpacing * cfg.ThicknessFactor)
 
-					sLatDeg, sLonDeg := toLatLon(uSub, vSub)
-					sElevNorm, sSlopeE, sSlopeN, sCurv := tg.sampleElevationAndSlopes(sLatDeg, sLonDeg)
-					sHeight := cfg.BaseElevation + (sElevNorm-cfg.SeaLevel+cfg.ElevationOffset)*cfg.ElevationScale
+			// Normal-aligned rotation quaternion
+			quat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, slopeE, slopeN)
 
-					sSlopeMag := math.Hypot(sSlopeE, sSlopeN)
-					sCoplanarity := 1.0 / (1.0 + 1.2*sSlopeMag*sSlopeMag + 0.8*math.Abs(sCurv))
-					minOverlap := math.Max(1.20, cfg.OverlapFactor*0.88)
-					sEffectiveOverlap := minOverlap + (cfg.OverlapFactor-minOverlap)*sCoplanarity
+			// Biome color
+			color := tg.computeBiomeColor(latDeg, lonDeg, elevNorm, slopeE, slopeN)
 
-					// On convex summits, tuck height downwards so upper disc surface sits flush
-					if sCurv < -0.5 {
-						tuck := math.Min(-0.35*sCurv/1000.0, 0.25*subSpacing)
-						sHeight -= tuck * cfg.ElevationScale
-					}
+			splats = append(splats, splat.Splat{
+				Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
+				Scale:    [3]float32{sx, sy, sz},
+				Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
+				Color:    color,
+			})
 
-					// Transform to Oblate Spheroid ECEF Cartesian position
-					posECEF := cfg.Spheroid.GeodeticToECEF(sLatDeg, sLonDeg, sHeight)
+			// Emit sea surface splat for ocean bed AND shoreline transition zone (up to +20m elevation)
+			// to cleanly intersect rising beach land slopes without stepped voids.
+			if elevNorm < cfg.SeaLevel+0.0025 {
+				seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
+				seaPosECEF := cfg.Spheroid.GeodeticToECEF(latDeg, lonDeg, seaHeight)
+				seaQuat := cfg.Spheroid.OrientationQuaternion(latDeg, lonDeg, 0, 0)
+				seaColor := tg.computeSeaSurfaceColor(latDeg, lonDeg, elevNorm)
+				seaSx := float32(0.5 * localSpacing * cfg.OverlapFactor)
+				seaSy := float32(0.5 * localSpacing * cfg.OverlapFactor)
+				seaSz := float32(0.5 * localSpacing * cfg.ThicknessFactor * 0.5)
 
-					sx := float32(0.5 * subSpacing * sEffectiveOverlap)
-					sy := float32(0.5 * subSpacing * sEffectiveOverlap)
-					sz := float32(0.5 * subSpacing * cfg.ThicknessFactor)
-
-					// Normal-aligned rotation quaternion
-					quat := cfg.Spheroid.OrientationQuaternion(sLatDeg, sLonDeg, sSlopeE, sSlopeN)
-
-					// Biome color
-					color := tg.computeBiomeColor(sLatDeg, sLonDeg, sElevNorm, sSlopeE, sSlopeN)
-
-					splats = append(splats, splat.Splat{
-						Position: [3]float32{float32(posECEF.X), float32(posECEF.Y), float32(posECEF.Z)},
-						Scale:    [3]float32{sx, sy, sz},
-						Rotation: [4]float32{float32(quat.W), float32(quat.X), float32(quat.Y), float32(quat.Z)},
-						Color:    color,
-					})
-
-					// Emit sea surface splat for ocean bed AND shoreline transition zone (up to +20m elevation)
-					// to cleanly intersect rising beach land slopes without stepped voids.
-					if sElevNorm < cfg.SeaLevel+0.0025 {
-						seaHeight := cfg.BaseElevation + cfg.ElevationOffset*cfg.ElevationScale
-						seaPosECEF := cfg.Spheroid.GeodeticToECEF(sLatDeg, sLonDeg, seaHeight)
-						seaQuat := cfg.Spheroid.OrientationQuaternion(sLatDeg, sLonDeg, 0, 0)
-						seaColor := tg.computeSeaSurfaceColor(sLatDeg, sLonDeg, sElevNorm)
-						seaSx := float32(0.5 * subSpacing * cfg.OverlapFactor)
-						seaSy := float32(0.5 * subSpacing * cfg.OverlapFactor)
-						seaSz := float32(0.5 * subSpacing * cfg.ThicknessFactor * 0.5)
-
-						splats = append(splats, splat.Splat{
-							Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
-							Scale:    [3]float32{seaSx, seaSy, seaSz},
-							Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
-							Color:    seaColor,
-						})
-					}
-				}
+				splats = append(splats, splat.Splat{
+					Position: [3]float32{float32(seaPosECEF.X), float32(seaPosECEF.Y), float32(seaPosECEF.Z)},
+					Scale:    [3]float32{seaSx, seaSy, seaSz},
+					Rotation: [4]float32{float32(seaQuat.W), float32(seaQuat.X), float32(seaQuat.Y), float32(seaQuat.Z)},
+					Color:    seaColor,
+				})
 			}
 		}
 	}

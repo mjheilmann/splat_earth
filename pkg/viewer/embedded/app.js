@@ -2102,7 +2102,6 @@
 
         // Geographic location navigation shortcuts
         const locs = [
-            { id: 'btn-loc-seattle', lat: 47.581, lon: -122.335, alt: 4.0 },
             { id: 'btn-loc-everest', lat: 27.988, lon: 86.925, alt: 18.0 },
             { id: 'btn-loc-trench', lat: 11.35, lon: 142.2, alt: 22.0 },
             { id: 'btn-loc-canyon', lat: 36.1, lon: -112.1, alt: 16.0 },
