@@ -4,6 +4,8 @@
 
 ![3D Spheroid Splat Terrain Viewer](docs/screenshot.png)
 
+![Orbit over the Great Lakes](docs/great_lakes.png)
+
 ---
 
 ## 📖 The "What-If" & The Pivot
@@ -190,4 +192,4 @@ splat-earth/
 
 ## 📜 License
 
-MIT License. Feel free to explore, fork, and build upon this experiment!
+[GNU General Public License v3.0 (GPL-3.0)](LICENSE). Feel free to explore, fork, and build upon this experiment!
