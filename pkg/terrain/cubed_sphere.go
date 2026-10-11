@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
-	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
+	"splat-earth/pkg/spheroid"
+	"splat-earth/pkg/splat"
 )
 
 // CubeFace represents one of the 6 cardinal faces of a spherified cube.

@@ -1,121 +1,193 @@
-# 3D Gaussian Splat Oblate Spheroid Terrain Spike
+# 🌍 splat-earth
 
-A high-performance Go spike investigating **geometry-less 3D Gaussian Splatting** for planetary & GIS terrain on **oblate spheroids** (non-flat ellipsoids of revolution such as WGS-84).
+> **A research spike investigating geometry-less 3D Gaussian Splatting for planetary-scale terrain on oblate spheroids (WGS-84), and why we pivoted to oriented surface surfels.**
+
+![3D Spheroid Splat Terrain Viewer](docs/screenshot.png)
+
+---
+
+## 📖 The "What-If" & The Pivot
+
+This project started as an experimental exploration: **Can geometry-less 3D Gaussian Splats replace traditional polygon meshes and heightmap tiles for planetary-scale GIS terrain?**
+
+### The Planetary Reality Check
+While Gaussian Splatting produces photorealistic novel-view synthesis for contained scenes, scaling it to planetary bodies (from 1,000 km orbital altitude down to 10-meter ground level) highlighted two fundamental roadblocks:
+
+1. **Astronomical Data Scale**: Representing an entire planetary spheroid across macroscopic and microscopic scales requires billions of Gaussian points. Without extreme hierarchical spatial partitioning, memory and network payloads quickly become prohibitive.
+2. **Near-Field Transparency Breakdown**: Traditional 3D Gaussians are semi-transparent volumetric ellipsoids that require continuous back-to-front sorting along the camera ray. When the camera flies close to large, coarse splats, their semi-transparency causes the surface to appear as a fuzzy, translucent cloud rather than solid ground.
+
+### The Solution: Oriented Surface Splats (Surfels)
+To eliminate these artifacts while preserving the geometry-less point-cloud pipeline, the engine pivoted to **normal-aligned surface surfels**:
+- **Tangent Disc Alignment**: Elliptical splats are aligned tangentially to the curved WGS-84 oblate spheroid surface using normal-aligned quaternions and local terrain elevation gradients.
+- **Hardware Depth Occlusion (Z-Buffer)**: By rendering terrain surfels with hardware depth-buffer writes, opaque ground remains solid and gapless up close—completely eliminating the need for expensive per-frame CPU radix sorting.
+- **Two-Pass Water Rendering**: Deep ocean trenches and continental shelves render in Pass 1 (opaque depth write), while the translucent sea surface renders in Pass 2 (depth write disabled with edge feathering) to eliminate seam artifacts.
+- **Hierarchical Cubed-Sphere Streaming**: Planetary terrain is partitioned into 384 cubed-sphere spatial chunks across 5 discrete LOD levels, dynamically streaming binary splat chunks into GPU VBOs based on Euclidean distance, gaze alignment, and planetary horizon culling.
 
 ---
 
 ## 🌟 Key Capabilities
 
-1. **Oblate Spheroid Geodesy & Math (`pkg/spheroid`)**:
-   - WGS-84 reference ellipsoid and scalable model spheroids with arbitrary flattening $f = (a - b) / a$.
-   - Geodetic $(\text{lat}, \text{lon}, h) \leftrightarrow \text{ECEF } (X, Y, Z)$ coordinate transformations.
-   - Surface normals and orthonormal East-North-Up (ENU) tangent frames.
-   - Normal-aligned rotation quaternions that orient each Gaussian ellipse tangentially along the curved spheroid surface with local terrain slope adjustments.
-
-2. **Data-Driven DEM Topography Engine (`pkg/terrain`, `cmd/generate`)**:
-   - **Real-World Earth DEM**: Directly samples high-resolution global elevation and ocean bathymetry from equirectangular rasters such as the [Wikimedia Commons World Elevation Map](https://commons.wikimedia.org/wiki/File:World_elevation_map.png) (21,600 × 10,800 1-arcminute global grid).
-   - **Steered Multi-Resolution Focus Areas**: Concentrates ultra-dense micro-splats in Areas of Interest (e.g. 10 sq miles, 64x–128x density, ~50m cell spacing) while keeping the global planet at base density (~1.8 km spacing) with smooth trigonometric boundary transitions and zero edge seams.
-   - Anisotropic splat sizing matching local metric grid spacing with polar meridian convergence compensation.
-   - Satellite-like biome color synthesis (deep ocean trenches, continental shelves, beaches, plains, highlands, craggy rock, and glacial snowcaps).
-
-3. **Standard 3DGS Serialization (`pkg/splat`)**:
-   - Standard 32-byte binary `.splat` format (compatible with web and GPU pipelines).
-   - Standard 3D Gaussian Splatting binary `.ply` format with spherical harmonics DC and log scales (compatible with external 3DGS tools).
-
-4. **Interactive 3D Splat Fly-Cam Viewer (`pkg/viewer`, `cmd/viewer`)**:
-   - WebGL 2.0 3D Gaussian Splat renderer running at 60+ FPS with chunked multi-LOD spatial streaming.
-   - **Fly Camera (6-DOF)**: WASD directional movement, Space/Shift altitude control, mouse drag look, and speed controls.
-   - **Orbit Camera**: Inspecting the planetary spheroid from orbit.
-   - Real-time geodetic telemetry HUD (Latitude, Longitude, Altitude above spheroid, Global vs Focus Spacing).
-   - Geographic landmark navigation shortcuts (Himalayas/Everest, Mariana Trench, Grand Canyon, Alps, Hawaii, Amazon Basin).
+- **Oblate Spheroid Geodesy (`pkg/spheroid`)**:
+  - Full WGS-84 reference ellipsoid ($a = 6,378.137\text{ km}$, $f = 1/298.257$).
+  - High-precision Geodetic $(\text{lat}, \text{lon}, h) \leftrightarrow \text{ECEF } (X, Y, Z)$ coordinate transformations using Bowring's method.
+  - Tangent East-North-Up (ENU) coordinate frames and rotation quaternions.
+- **Data-Driven DEM Topography Engine (`pkg/terrain`)**:
+  - Auto-discovers and composites multi-resolution elevation rasters, satellite GeoTIFFs, and LiDAR DEMs.
+  - Cubed-sphere quadtree tiling that avoids polar coordinate singularity distortions.
+  - Steered high-density focus zones (up to 128x density over areas of interest with smooth trigonometric boundary blending).
+- **Compact 32-Byte Binary Splat Format (`pkg/splat`)**:
+  - Standard 32-byte layout: Position $(3 \times f32)$, Scale $(3 \times f32)$, RGBA $(4 \times u8)$, Quaternion $(4 \times u8)$.
+  - Multi-LOD chunk container format with zero-copy binary streaming.
+- **Interactive 6-DOF WebGL 2.0 Viewer (`pkg/viewer`, `cmd/viewer`)**:
+  - 60+ FPS rendering of hundreds of millions of virtual splats.
+  - 6-DOF Fly Camera with planetary horizon auto-leveling + Orbit Camera.
+  - Real-time geodetic telemetry HUD (Lat, Lon, Altitude, Active Splats, Visible Chunks).
 
 ---
 
-### Supported Elevation & Imagery Datasets
+## 🗺️ Obtaining Input Datasets
 
-The engine features an automatic GeoData Catalog (`pkg/terrain/catalog.go`) that scans the `images/` folder, parses GeoTIFF geokeys, bounding boxes, and projections, and blends the highest-resolution color and topography layers available.
+The terrain generator features an automatic GeoData Catalog (`pkg/terrain/catalog.go`) that scans the `images/` directory at startup, reads GeoTIFF geokeys, bounding boxes, and projections, and blends the highest-resolution layers available.
 
-#### 1. NASA Blue Marble: Next Generation (500m Global True Color & Topo/Bathy)
-Directly consume NASA's high-resolution global 500m GeoTIFF imagery and topography tiles:
-- **Source**: [NASA Earth Observatory - Blue Marble: Next Generation](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/)
-- **Base Topography & Bathymetry**: [NASA Blue Marble Base Topography/Bathymetry](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/base-topography-bathymetry/)
-- **Resolution**: 500 meters / pixel ($21,600 \times 21,600$ per quadrant, $86,400 \times 43,200$ global).
-- **Format**: 8-quadrant GeoTIFF tiles (A1, A2, B1, B2, C1, C2, D1, D2).
-- **Usage**: Drop any or all 8 `world.topo.bathy.*_geo.tif` tiles into the `images/` directory. The engine auto-discovers them and maps 24-bit True Color satellite photorealism directly onto the splats.
+Create an `images/` folder in the project root:
+```bash
+mkdir -p images
+```
 
-#### 2. GEBCO Global Ocean Bathymetry & Land Elevation (1km Grid)
-- **Source**: [GEBCO (General Bathymetric Chart of the Oceans)](https://www.gebco.net/)
-- **Resolution**: ~1 km grid ($43,200 \times 21,600$ global).
-- **Format**: 8-quadrant elevation (`gebco_08_rev_elev_*_grey_geo.tif`) and bathymetry (`gebco_08_rev_bath_*_grey_geo.tif`) GeoTIFFs.
-- **Usage**: Drop into `images/` for sub-pixel bilinear-interpolated terrestrial elevation and ocean trench topography.
+> **Note**: The `images/` and `splats/` folders are excluded from git via `.gitignore` to prevent committing massive multi-gigabyte rasters.
 
-#### 3. Global Elevation & Bathymetry Fallback Map
-- **Source**: [Wikimedia Commons - File:World elevation map.png](https://commons.wikimedia.org/wiki/File:World_elevation_map.png)
-- **Resolution**: 21,600 × 10,800 pixels (~1.85 km per pixel at the equator).
-- **Format**: Equirectangular global grayscale elevation map (0 = −11,000m Mariana Trench, 143 = Sea Level, 255 = +8,848m Mt. Everest).
+### 1. Wikimedia Global Elevation Map (Quickest Fallback)
+A single 21,600 × 10,800 equirectangular grayscale elevation raster (~75 MB) covering the entire globe (~1.85 km per pixel at the equator).
 
-#### 4. High-Resolution Focus Areas (USGS 3DEP 1-Meter LiDAR DEMs)
-For ultra-high resolution focus zones (down to 1-meter physical resolution):
+- **Download**: [Wikimedia Commons - World Elevation Map](https://commons.wikimedia.org/wiki/File:World_elevation_map.png)
+- **Direct Image Link**: Click "Original file" (21,600 × 10,800 pixels) on the Wikimedia page.
+- **Destination**: Save directly as `images/World_elevation_map.png`.
+
+### 2. NASA Blue Marble: Next Generation (500m Global Satellite Imagery)
+True-color satellite photography and global topography/bathymetry at 500 meters per pixel ($86,400 \times 43,200$ global pixels).
+
+- **Overview**: [NASA Earth Observatory - Blue Marble: Next Generation](https://science.nasa.gov/earth/earth-observatory/blue-marble-next-generation/)
+- **Data Archive**: [Visible Earth - Blue Marble 500m Topography & Bathymetry](https://visibleearth.nasa.gov/images/73934/august-blue-marble-next-generation-w-topography-and-bathymetry)
+- **Tiles**: 8 quadrant GeoTIFF files (`A1`, `A2`, `B1`, `B2`, `C1`, `C2`, `D1`, `D2`), e.g.:
+  - `world.topo.bathy.200408.3x21600x21600.A1_geo.tif`
+  - `world.topo.bathy.200408.3x21600x21600.A2_geo.tif`
+  - ... through `D2_geo.tif`
+- **Destination**: Drop any or all 8 tiles into `images/`. The generator auto-detects them and applies satellite true-color photorealism to the splats.
+
+### 3. GEBCO Global Ocean Bathymetry & Land Elevation (1km Grid)
+High-precision sub-pixel digital elevation models for oceanic trenches (e.g. Mariana Trench) and continental shelf topography.
+
+- **Source**: [GEBCO (General Bathymetric Chart of the Oceans)](https://www.gebco.net/data_and_products/gridded_bathymetry_data/)
+- **Tiles**: 8 elevation (`gebco_08_rev_elev_*_grey_geo.tif`) and 8 bathymetry (`gebco_08_rev_bath_*_grey_geo.tif`) GeoTIFFs.
+- **Destination**: Place into `images/` for sub-pixel bilinear elevation sampling.
+
+### 4. USGS 3DEP 1-Meter LiDAR DEMs (Ultra-Resolution Focus Zones)
+For sub-meter terrain detail over specific cities, parks, or mountain peaks:
+
 - **Source**: [USGS 3DEP LiDAR Explorer](https://apps.nationalmap.gov/lidar-explorer/#/)
-- **Resolution**: 1.0 meter / pixel (floating-point GeoTIFF elevation rasters).
-- **Usage**: Drop downloaded `.tif` DEM files into the `images/` folder. The generator automatically detects any DEM tiles present, extracts their geographic bounding boxes (via UTM Zone $\leftrightarrow$ Geodetic projection), and blends them as high-density LiDAR focus layers over the global world heightmap.
-
-> **Note**: The `images/` folder and `splats/` output directory are excluded in `.gitignore` so large multi-gigabyte datasets are never committed to git.
+- **Destination**: Download floating-point GeoTIFF DEMs (e.g., Rainier, Mount St. Helens, Grand Canyon) and drop them into `images/`. The generator parses their UTM/Geodetic projections and stamps them as high-density focus zones onto the planetary spheroid.
 
 ---
 
 ## 🚀 Quick Start
 
-### 1. Build and Generate Terrain Splats
+### 1. Build the Binaries
+Ensure you have [Go](https://go.dev/) (1.22 or newer) installed:
+
 ```bash
-# Build the generator and viewer binaries
-go build ./cmd/generate && go build ./cmd/viewer
+# Build the terrain generator and viewer server
+go build ./cmd/generate
+go build ./cmd/viewer
+```
 
-# Option A: Standard Dramatic Relief (3.2x vertical exaggeration, 1.0 km height scale)
-./generate -out splats/world.splat
+### 2. Generate Terrain Splats
 
-# Option B: True 1:1 Physical Scale (Authentic unexaggerated real-world Earth geometry)
-./generate -elev-scale 0.311 -out splats/world.splat
-
-# Option C: Fast low-resolution preview
+#### Option A: Fast Low-Resolution Preview (~5 seconds)
+```bash
 ./generate -res-lat 150 -res-lon 300 -out splats/preview.splat
 ```
 
-#### Generator Flags:
+#### Option B: Standard Relief (3.2x Exaggeration, 1.0 km Height Scale)
+```bash
+./generate -out splats/world.splat
+```
+
+#### Option C: True 1:1 Physical Scale (Authentic Earth Curvature)
+```bash
+./generate -elev-scale 0.311 -out splats/world.splat
+```
+
+#### Option D: High-Density Focus Area (e.g., Mount Rainier 64x density)
+```bash
+./generate -focus-enable -focus-lat 46.852 -focus-lon -121.760 -focus-area 25 -focus-boost 64 -out splats/rainier.splat
+```
+
+#### Common Generator Flags:
 | Flag | Default | Description |
 |---|---|---|
 | `-out` | `splats/terrain.splat` | Output path (`.splat` multi-LOD container or `.ply`) |
-| `-elev-scale` | `1.0` | Peak elevation scale in km (`1.0` = 3.2x dramatic relief, `0.311` = true 1:1 physical scale) |
-| `-elev-offset` | `0.0` | Baseline elevation offset (-0.5 to +0.5) |
-| `-radius` | `100.0` | Equatorial radius $a$ in km (WGS-84 oblate spheroid model) |
-| `-flattening` | `0.0033528` | WGS-84 standard flattening ratio $f = (a - b) / a$ (0.335%) |
-| `-res-lat`, `-res-lon` | `0` (Auto) | Global raster grid resolution (`0` = Auto native source limit, e.g. $21,600 \times 43,200$) |
-| `-patches` | `0` (Auto) | Patches per face axis (`0` = Auto optimal, e.g. `8` => 384 chunks) |
-| `-overlap` | `1.38` | Splat footprint overlap multiplier (gapless coverage) |
-| `-thickness` | `0.035` | Normal thickness ratio (surface-flat disc alignment) |
-| `-raster` | `images/World_elevation_map.png` | Fallback DEM raster path |
+| `-elev-scale` | `1.0` | Peak elevation scale in km (`1.0` = 3.2x dramatic relief, `0.311` = authentic 1:1) |
+| `-radius` | `100.0` | Spheroid equatorial radius $a$ in visualization km |
+| `-flattening` | `0.0033528` | WGS-84 standard flattening ratio $f = (a - b) / a$ |
+| `-res-lat`, `-res-lon` | `0` (Auto) | Elevation grid resolution (`0` = auto-detect from source rasters) |
+| `-overlap` | `1.38` | Splat footprint overlap factor (ensures gapless coverage) |
+| `-thickness` | `0.035` | Splat normal thickness ratio (flattens discs along surface) |
+| `-raster` | `images/World_elevation_map.png` | Fallback elevation raster path |
 | `-biome-config` | `config/biomes.json` | Path to JSON biome hypsometry & color tuning config |
 
 ---
 
-### 2. Launch Interactive 3D Viewer
+### 3. Launch the Interactive 3D Viewer
+
+Start the local streaming server (auto-detects `splats/world.splat` or `splats/terrain.splat`):
+
 ```bash
-# Start viewer (auto-detects splats/terrain.splat or splats/world.splat)
 ./viewer -port 8080
 ```
 
-#### Viewer Navigation Controls:
-- **Fly Mode**:
+Open your browser to [http://localhost:8080](http://localhost:8080).
+
+#### Navigation & Controls:
+- **Fly Camera Mode**:
   - `W` / `S`: Move Forward / Backward
   - `A` / `D`: Strafe Left / Right
-  - `Q` / `E`: Roll Left / Right (6-DOF, no gimbal lock)
+  - `Q` / `E`: Roll Left / Right (6-DOF, gimbal-lock free)
   - `Space` / `C`: Climb Up / Dive Down
+  - `H`: Toggle Auto-Horizon (locks camera up-vector to local spheroid surface normal)
   - `Mouse Drag`: Pitch & Yaw free look
-  - `Mouse Wheel` / `Slider`: Adjust flight velocity
-- **Orbit Mode**:
-  - `Left Click + Drag`: Orbit around spheroid
-  - `Mouse Wheel`: Zoom In / Out
-- **HUD & Tuning Sidebar**:
-  - **Color Mode**: Realistic Biomes, Elevation Hypsometric Colormap, Surface Normals, Gaussian Footprint Debug
-  - **Lighting**: Dynamic Sun Shading, Azimuth, Altitude, Atmospheric Haze
-  - **Navigation Shortcuts**: Quick jump to Everest, Mariana Trench, Grand Canyon, Alps, Hawaii, Amazon Basin
+  - `Mouse Wheel`: Adjust flight speed
+- **Orbit Camera Mode**:
+  - `Left Click + Drag`: Orbit around planetary body
+  - `Mouse Wheel`: Zoom in / out
+- **Tuning Sidebar**:
+  - **Color Modes**: Satellite Biomes, Hypsometric Colormap (Turbo), Surface Normals, Footprint Debug.
+  - **Lighting & Atmosphere**: Sun Azimuth & Altitude, Sunlight Intensity, Rayleigh Atmospheric Haze.
+  - **Landmark Shortcuts**: Everest, Mariana Trench, Grand Canyon, Alps, Hawaii, Amazon Basin.
+
+---
+
+## 🏛️ Project Architecture
+
+```
+splat-earth/
+├── cmd/
+│   ├── generate/          # CLI tool for DEM ingestion & splat generation
+│   └── viewer/            # Standalone HTTP streaming server binary
+├── config/
+│   └── biomes.json        # Hypsometry curves and elevation-to-biome color table
+├── docs/
+│   └── screenshot.png     # Application screenshot for documentation
+├── pkg/
+│   ├── spheroid/          # WGS-84 geodesy math (ECEF, ENU, Bowring's method, normals)
+│   ├── terrain/           # DEM catalog, GeoTIFF decoder, cubed-sphere patch tiling
+│   ├── splat/             # 32-byte splat serialization & chunked multi-LOD container
+│   └── viewer/            # Embedded WebGL 2.0 SPA & HTTP chunk streaming API
+├── images/                # (Ignored) GeoTIFFs, DEM rasters, and elevation PNGs
+└── splats/                # (Ignored) Output .splat container files
+```
+
+---
+
+## 📜 License
+
+MIT License. Feel free to explore, fork, and build upon this experiment!

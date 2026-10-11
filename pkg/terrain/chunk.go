@@ -3,8 +3,8 @@ package terrain
 import (
 	"math"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
-	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
+	"splat-earth/pkg/spheroid"
+	"splat-earth/pkg/splat"
 )
 
 // Chunk represents a spatial quad tile on the oblate spheroid with multi-resolution LODs.

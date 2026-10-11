@@ -10,8 +10,8 @@ import (
 	"runtime"
 	"time"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/terrain"
-	"github.com/mjheilmann/gaussian-splat-app/pkg/viewer"
+	"splat-earth/pkg/terrain"
+	"splat-earth/pkg/viewer"
 )
 
 func main() {

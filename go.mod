@@ -1,4 +1,4 @@
-module github.com/mjheilmann/gaussian-splat-app
+module splat-earth
 
 go 1.27
 

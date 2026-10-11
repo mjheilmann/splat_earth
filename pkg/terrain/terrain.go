@@ -5,8 +5,8 @@ import (
 	"runtime"
 	"sync"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/spheroid"
-	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
+	"splat-earth/pkg/spheroid"
+	"splat-earth/pkg/splat"
 )
 
 // DensityZone defines a steered high-density area of interest (AOI) on the spheroid.

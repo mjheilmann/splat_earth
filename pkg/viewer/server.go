@@ -10,8 +10,8 @@ import (
 	"strconv"
 	"sync"
 
-	"github.com/mjheilmann/gaussian-splat-app/pkg/splat"
-	"github.com/mjheilmann/gaussian-splat-app/pkg/terrain"
+	"splat-earth/pkg/splat"
+	"splat-earth/pkg/terrain"
 )
 
 //go:embed embedded/*
